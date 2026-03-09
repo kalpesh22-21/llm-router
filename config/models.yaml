@@ -1,0 +1,12 @@
+models:
+  - model_id: gpt-4o
+    base_url: https://api.openai.com/v1
+    api_key: ""  # empty = use API_KEY env var
+
+  - model_id: llama-3-70b
+    base_url: http://llama-server:8000/v1
+    api_key: ""
+
+  - model_id: mistral-7b
+    base_url: http://mistral-server:8000/v1
+    api_key: "hardcoded-key-here"

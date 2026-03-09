@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker compose up -d)",
+      "Bash(docker compose ps)",
+      "Bash(docker compose logs app)",
+      "Bash(docker compose build app --quiet)",
+      "Bash(docker compose up -d app)",
+      "Bash(curl -s -X POST http://localhost:8000/auth/login -H \"Content-Type: application/json\" -d '{\"\"username\"\":\"\"admin\"\",\"\"password\"\":\"\"admin123\"\"}')",
+      "Bash(python3 -m json.tool)",
+      "Bash(docker exec:*)",
+      "Bash(curl -s -X POST http://localhost:8000/auth/login -H \"Content-Type: application/json\" -d '{\"\"username\"\":\"\"diana\"\",\"\"password\"\":\"\"diana123\"\"}')",
+      "Bash(docker exec llm-router-ldap ldapsearch -x -H ldap://localhost -D \"cn=admin,dc=example,dc=com\" -w adminpassword -b \"dc=example,dc=com\" \"\\(uid=diana\\)\" dn)",
+      "Bash(docker compose stop ldap)",
+      "Bash(docker compose rm -f ldap)",
+      "Bash(docker volume rm llm-router_ldap-data llm-router_ldap-config)",
+      "Bash(docker compose up -d ldap)",
+      "Bash(docker compose ps ldap)",
+      "Bash(docker exec llm-router-ldap ldapsearch -x -H ldap://localhost -D \"cn=admin,dc=example,dc=com\" -w adminpassword -b \"dc=example,dc=com\" \"\\(uid=kalpesh\\)\" uid mail)",
+      "Bash(curl -s -X POST http://localhost:8000/auth/login -H \"Content-Type: application/json\" -d '{\"\"username\"\":\"\"kalpesh\"\",\"\"password\"\":\"\"kalpesh\"\"}')",
+      "Bash(curl -s http://localhost:8000/ui/)",
+      "Bash(docker ps --format \"table {{.Names}}\\\\t{{.Status}}\")",
+      "Bash(curl -s http://localhost:8000/ui/style.css)",
+      "Bash(curl -s http://localhost:8000/ui/app.js)"
+    ]
+  }
+}

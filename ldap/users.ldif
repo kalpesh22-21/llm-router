@@ -1,0 +1,54 @@
+# =============================================================================
+# Bootstrap LDIF — loaded by osixia/openldap on first container start
+# Users: admin / alice / bob / charlie   (passwords match username + "123")
+# =============================================================================
+
+# People organisational unit
+dn: ou=people,dc=example,dc=com
+objectClass: organizationalUnit
+ou: people
+
+# ── admin ─────────────────────────────────────────────────────────────────────
+dn: uid=admin,ou=people,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: admin
+cn: Admin User
+sn: User
+mail: admin@example.com
+userPassword: admin123
+
+# ── alice ─────────────────────────────────────────────────────────────────────
+dn: uid=alice,ou=people,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: alice
+cn: Alice Smith
+sn: Smith
+mail: alice@example.com
+userPassword: alice123
+
+# ── bob ───────────────────────────────────────────────────────────────────────
+dn: uid=bob,ou=people,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: bob
+cn: Bob Jones
+sn: Jones
+mail: bob@example.com
+userPassword: bob123
+
+# ── charlie ───────────────────────────────────────────────────────────────────
+dn: uid=charlie,ou=people,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: charlie
+cn: Charlie Brown
+sn: Brown
+mail: charlie@example.com
+userPassword: charlie123
+
+# ── kalpesh ───────────────────────────────────────────────────────────────────
+dn: uid=kalpesh,ou=people,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: kalpesh
+cn: Kalpesh Mulye
+sn: Mulye
+mail: kalpe@example.com
+userPassword: kalpesh

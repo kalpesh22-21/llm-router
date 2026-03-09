@@ -1,0 +1,161 @@
+version: "3.9"
+
+# =============================================================================
+# LLM Router — local development stack
+# Services: app, mysql, redis, prometheus, ldap
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # OpenLDAP — dummy directory for local dev
+  # Users: admin/admin123  alice/alice123  bob/bob123  charlie/charlie123
+  # ---------------------------------------------------------------------------
+  ldap:
+    image: osixia/openldap:1.5.0
+    container_name: llm-router-ldap
+    restart: unless-stopped
+    environment:
+      LDAP_ORGANISATION: "Example Corp"
+      LDAP_DOMAIN: "example.com"          # → dc=example,dc=com
+      LDAP_ADMIN_PASSWORD: "adminpassword"
+      LDAP_TLS: "false"
+      LDAP_REMOVE_CONFIG_AFTER_SETUP: "true"
+    # --copy-service is required for bootstrap LDIF files to be loaded
+    command: ["--copy-service", "--loglevel", "warning"]
+    ports:
+      - "389:389"
+    volumes:
+      - ./ldap/users.ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom/users.ldif
+      - ldap-data:/var/lib/ldap
+      - ldap-config:/etc/ldap/slapd.d
+    healthcheck:
+      test: ["CMD", "ldapwhoami", "-H", "ldap://localhost",
+             "-D", "cn=admin,dc=example,dc=com", "-w", "adminpassword", "-x"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - llm-router-net
+
+  # ---------------------------------------------------------------------------
+  # LLM Router application
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm-router-app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: mysql+aiomysql://root:password@mysql:3306/llm_router
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-secret-key-change-in-production
+      JWT_ALGORITHM: HS256
+      JWT_EXPIRE_MINUTES: "60"
+      # Points at the local OpenLDAP container
+      LDAP_SERVER: ldap://ldap:389
+      LDAP_BASE_DN: dc=example,dc=com
+      LDAP_BIND_DN: cn=admin,dc=example,dc=com
+      LDAP_BIND_PASSWORD: adminpassword
+      SUPERUSER_USERNAME: admin
+      MODELS_CONFIG_PATH: config/models.yaml
+      API_KEY: ""
+      PROMETHEUS_PORT: "9090"
+    volumes:
+      - ./config:/app/config:ro
+      - ./app:/app/app:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ldap:
+        condition: service_healthy
+    networks:
+      - llm-router-net
+
+  # ---------------------------------------------------------------------------
+  # MySQL 8.0
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: llm-router-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: llm_router
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # schema.sql runs first (s-c < s-e), seed.sql second
+      - ./migrations/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+      - ./migrations/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-ppassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - llm-router-net
+
+  # ---------------------------------------------------------------------------
+  # Redis 7
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: llm-router-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - llm-router-net
+
+  # ---------------------------------------------------------------------------
+  # Prometheus
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: llm-router-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    depends_on:
+      - app
+    networks:
+      - llm-router-net
+
+# =============================================================================
+# Volumes & Networks
+# =============================================================================
+
+volumes:
+  mysql-data:
+  redis-data:
+  prometheus-data:
+  ldap-data:
+  ldap-config:
+
+networks:
+  llm-router-net:
+    driver: bridge
