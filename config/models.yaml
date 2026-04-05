@@ -1,12 +1,53 @@
 models:
+  # -------------------------------------------------------------------------
+  # Static backends (Phase 1) — single URL per model
+  # -------------------------------------------------------------------------
   - model_id: gpt-4o
     base_url: https://api.openai.com/v1
     api_key: ""  # empty = use API_KEY env var
 
+  # -------------------------------------------------------------------------
+  # Multi-cluster backends (Phase 2) — N cluster URLs per model
+  #
+  # local_cluster_id identifies which cluster this router instance lives in.
+  # Omit it here and set the ROUTER_CLUSTER_ID environment variable instead
+  # to keep the same models.yaml deployable to every cluster.
+  # -------------------------------------------------------------------------
   - model_id: llama-3-70b
-    base_url: http://llama-server:8000/v1
-    api_key: ""
+    type: multi_cluster
+    clusters:
+      - cluster_id: us-west
+        base_url: http://llama-us-west.internal/v1
+        api_key: ""
+      - cluster_id: us-east
+        base_url: http://llama-us-east.internal/v1
+        api_key: ""
+      - cluster_id: eu-central
+        base_url: http://llama-eu.internal/v1
+        api_key: ""
+    routing:
+      # local_cluster_id: us-west   # override ROUTER_CLUSTER_ID for this model
+      spill_ratio: 0.8              # spill to remote when local load_ratio > this
+      seed_capacity_tokens: 200000  # initial capacity estimate (tokens)
+      default_max_tokens: 2048      # fallback when request omits max_tokens
+      cache_ttl_seconds: 3600       # how long to remember cluster → context mapping
+      ttft_budget_ms: 500           # TTFT above this → cluster is stressed
+      itl_budget_ms: 80             # mean ITL above this → cluster is stressed
+      ttft_alpha: 0.1               # EWMA factor for TTFT (slow — queue changes gradually)
+      itl_alpha: 0.2                # EWMA factor for ITL  (faster — decode saturates quickly)
+      capacity_alpha: 0.1           # capacity adaptation rate
 
   - model_id: mistral-7b
-    base_url: http://mistral-server:8000/v1
-    api_key: "hardcoded-key-here"
+    type: multi_cluster
+    clusters:
+      - cluster_id: us-west
+        base_url: http://mistral-us-west.internal/v1
+        api_key: ""
+      - cluster_id: us-east
+        base_url: http://mistral-us-east.internal/v1
+        api_key: ""
+    routing:
+      spill_ratio: 0.8
+      seed_capacity_tokens: 100000  # smaller model, less KV memory
+      default_max_tokens: 2048
+      itl_budget_ms: 40             # 7B model is faster; tighter ITL budget
