@@ -257,7 +257,7 @@ class PermissionService:
         if default_bucket:
             bucket_ids_within_user_access.add(default_bucket.id)
 
-        # If available_model_ids provided, filter to only buckets where ALL models are available
+        # If available_model_ids provided, keep buckets that have at least one available model
         if available_model_ids is not None:
             # Get all buckets with their models
             result = await db.execute(
@@ -285,8 +285,11 @@ class PermissionService:
         """
         Return all model_ids accessible to *user_id* via their bucket grants.
 
-        Only returns models from buckets where ALL models in the bucket are available
-        in the backend.
+        For each accessible bucket, returns the subset of its models that are
+        currently available in the backend — i.e. the bucket's models intersected
+        with ``available_model_ids``. This is a per-model filter, NOT an
+        all-or-nothing-per-bucket rule. The default bucket is included for every
+        user.
         """
         default_model_id = await self.get_default_model(db=db)
         default_bucket = await self.get_default_bucket(db=db)

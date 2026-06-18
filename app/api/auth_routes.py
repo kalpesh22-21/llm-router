@@ -76,15 +76,35 @@ async def get_current_user_payload_from_request(
     """
     Extract and decode JWT from x-api-key header (Anthropic SDK compatible),
     falling back to Authorization: Bearer header.
+
+    Tries each present credential in priority order (x-api-key first, then
+    Bearer).  If one fails to decode the next is tried, so a non-JWT value in
+    x-api-key (e.g. a placeholder or upstream vLLM key) does not block a valid
+    router JWT supplied via Authorization: Bearer.
     """
-    api_key = request.headers.get("x-api-key")
+    candidates: list[str] = []
+    api_key = (request.headers.get("x-api-key") or "").strip()
     if api_key:
-        return decode_token(api_key)
+        candidates.append(api_key)
     if credentials:
-        return decode_token(credentials.credentials)
+        candidates.append(credentials.credentials)
+
+    if not candidates:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authentication. Provide x-api-key or Authorization: Bearer header.",
+        )
+
+    for token in candidates:
+        try:
+            return decode_token(token)
+        except HTTPException:
+            continue
+
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Missing authentication. Provide x-api-key or Authorization: Bearer header.",
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
     )
 
 
@@ -154,22 +174,23 @@ async def login(
     auth_method = "LDAP" if ldap_authenticated else "admin-env"
     logger.debug("User %r authenticated via %s", body.username, auth_method)
 
-    # 3. Upsert user in DB (for LDAP users)
-    if (
-        user is not None
-        and body.username == settings.SUPERUSER_USERNAME
-        and not user.is_admin
-    ):
-        user.is_admin = True
-
+    # 3. Upsert user in DB (for LDAP users).
+    # Admin/superuser status is established ONLY through the env-based bootstrap:
+    # the SUPERUSER_USERNAME + ADMIN_INITIAL_PASSWORD path here and
+    # _create_default_admin_user() at startup. An LDAP login never auto-grants
+    # admin — a matching username alone is not enough, and an existing account is
+    # never re-promoted on login. Manage roles via the admin UI afterwards.
     if user is None:
         # Fetch extra info from LDAP (email, etc.)
         ldap_info = get_ldap_user_info(body.username, body.password)
         email = ldap_info.get("email")
 
-        # First user ever with the bootstrap username gets admin privileges
-        user_count = await permission_service.count_users(db)
-        is_admin = user_count == 0 or body.username == settings.SUPERUSER_USERNAME
+        # Only the env-authenticated superuser is created as admin. Reaching here
+        # with ldap_authenticated == False means LDAP failed but the
+        # SUPERUSER_USERNAME + ADMIN_INITIAL_PASSWORD checks above passed, i.e.
+        # this is the env superuser. Everyone authenticating via LDAP is a
+        # normal user.
+        is_admin = not ldap_authenticated
 
         user = await permission_service.create_user(
             db,

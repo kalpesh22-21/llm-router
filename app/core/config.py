@@ -114,6 +114,13 @@ class MultiClusterModelConfig:
     routing: RoutingConfig
 
 
+# Known-insecure placeholder for JWT_SECRET_KEY. If Vault is enabled but the
+# resolved secret is still this value (e.g. a transient Vault failure fell back
+# to the default), the app must refuse to boot rather than serve with a public,
+# forgeable signing key. See validate_vault_secrets() / load_settings_from_vault().
+_INSECURE_JWT_SECRET_DEFAULT = "change-me-in-production-use-long-random-string"
+
+
 class Settings(BaseSettings):
     class Config:
         env_file = os.getenv(
@@ -181,7 +188,7 @@ class Settings(BaseSettings):
 
     # JWT / Auth
     JWT_SECRET_KEY: StrippedString = Field(
-        default="change-me-in-production-use-long-random-string",
+        default=_INSECURE_JWT_SECRET_DEFAULT,
         description="Secret key for JWT token generation",
         env="JWT_SECRET_KEY",
     )
@@ -531,6 +538,19 @@ def load_settings_from_vault() -> Settings:
         logger = logging.getLogger(__name__)
         logger.warning(
             f"Failed to load settings from Vault: {e}. Using environment variables."
+        )
+
+    # Fail closed: Vault is enabled (we only reach here when VAULT_ENABLED is
+    # true), so the JWT signing key MUST have come from Vault. If it is still
+    # the public placeholder or empty — e.g. a transient Vault failure fell
+    # through to the default above — refuse to boot rather than silently serve
+    # with a forgeable signing key. Crashing lets the orchestrator restart the
+    # pod once Vault is healthy again.
+    if not settings.JWT_SECRET_KEY or settings.JWT_SECRET_KEY == _INSECURE_JWT_SECRET_DEFAULT:
+        raise RuntimeError(
+            "JWT_SECRET_KEY was not provided by Vault (still the insecure default "
+            "or empty). Refusing to start to avoid serving with a forgeable JWT "
+            "signing key. Check Vault connectivity and JWT_CREDS_PATH."
         )
 
     return settings

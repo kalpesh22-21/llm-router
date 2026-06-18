@@ -78,6 +78,15 @@ class ContentChecker(ABC):
 # ---------------------------------------------------------------------------
 
 
+# Upper bound on how much text we run a regex against, to limit worst-case
+# backtracking time on large user-supplied bodies. A match beyond this offset is
+# not detected — acceptable since rules target prompt text, not bulk payloads.
+# NOTE: this bounds the large-input case only; a pathological pattern can still
+# backtrack on a small crafted input. A hard guarantee would need re2 or a
+# regex engine with timeout support.
+MAX_REGEX_SCAN_CHARS = 100_000
+
+
 class RegexContentChecker(ContentChecker):
     """Check content against a regex pattern."""
 
@@ -87,9 +96,21 @@ class RegexContentChecker(ContentChecker):
         if not rule.pattern:
             return False, None, rule.violation_message
 
+        # Bound the input length to limit worst-case regex backtracking time.
+        scan_content = content
+        if len(content) > MAX_REGEX_SCAN_CHARS:
+            logger.warning(
+                "Rule '%s': content of %d chars exceeds scan cap; "
+                "only the first %d chars are checked.",
+                rule.name,
+                len(content),
+                MAX_REGEX_SCAN_CHARS,
+            )
+            scan_content = content[:MAX_REGEX_SCAN_CHARS]
+
         try:
             pattern = re.compile(rule.pattern, re.IGNORECASE)
-            match = pattern.search(content)
+            match = pattern.search(scan_content)
             if match:
                 return True, match.group(0), rule.violation_message
         except re.error as e:
@@ -224,17 +245,48 @@ class SharedFiltersState:
 
 async def background_rules_updater(shared_filter_state: SharedFiltersState):
     while True:
-        # Simulate I/O or delay
-        await asyncio.sleep(settings.CONTENT_FILTER_REFRESH)
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(
-                select(ContentFilterRule)
-                .where(ContentFilterRule.is_active == True)
-                .order_by(ContentFilterRule.created_at.asc())
+        try:
+            # Simulate I/O or delay
+            await asyncio.sleep(settings.CONTENT_FILTER_REFRESH)
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(ContentFilterRule)
+                    .where(ContentFilterRule.is_active == True)
+                    .order_by(ContentFilterRule.created_at.asc())
+                )
+                # Materialize INSIDE the session — async results need the live
+                # session; reading them after the `async with` block exits raises.
+                fresh_rules = list(result.scalars().all())
+            async with shared_filter_state.lock:  # Acquire lock before modification
+                shared_filter_state.rules = fresh_rules
+            logger.debug("Rules updated: %d rules loaded.", len(fresh_rules))
+        except Exception:
+            # Never let a transient DB error escape the loop — that would kill the
+            # updater permanently and silently disable all content filtering.
+            logger.exception(
+                "background_rules_updater tick failed; retrying next interval"
             )
-        async with shared_filter_state.lock:  # Acquire lock before modification [6, 12]
-            shared_filter_state.rules = list(result.scalars().all())
-        logger.debug("Rules Updated.")
+
+
+def _extract_text(content: Any) -> str:
+    """
+    Flatten a message-style ``content`` value into scannable text.
+
+    Handles a plain string, a list of structured parts (e.g. OpenAI multimodal
+    ``[{"type": "text", "text": ...}, {"type": "image_url", ...}]`` — non-text
+    parts are skipped rather than raising a KeyError), or ``None``.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts)
+    return ""
 
 
 class ContentFilterService:
@@ -326,51 +378,45 @@ class ContentFilterService:
 
     async def check_request_body(self, body: Dict[str, Any]) -> FilterResult:
         """
-        Check a chat completion request body for content violations.
+        Check a chat-completion / messages request body for content violations.
 
-        Extracts content from messages array and checks each message's content.
+        Scans every user-influenced text surface: the top-level ``system`` field
+        (Anthropic-style requests), each message's ``content`` (string or
+        structured list of parts), and assistant ``tool_calls[].function.arguments``.
+        First matching rule wins.
         """
-        messages = body.get("messages", [])
-        if not messages:
-            return FilterResult(is_violation=False)
-
-        # Get all active rules to determine which fields to check
+        # Nothing to do if there are no active rules.
         async with self.shared_filter_state.lock:
             rules = self.shared_filter_state.rules.copy()
         if not rules:
             return FilterResult(is_violation=False)
 
-        # Build set of fields that need checking
-        fields_to_check: Set[str] = set()
-        for rule in rules:
-            if rule.fields_to_check:
-                fields_to_check.update(
-                    f.strip() for f in rule.fields_to_check.split(",")
-                )
-            else:
-                fields_to_check.add("content")
+        # Collect (role, text) segments across all user-influenced fields.
+        segments = []
 
-        for message in messages:
+        # Top-level system prompt (Anthropic /v1/messages and some OpenAI-compatible).
+        system_text = _extract_text(body.get("system"))
+        if system_text:
+            segments.append(("system", system_text))
+
+        for message in body.get("messages", []):
             if not isinstance(message, dict):
                 continue
-
-            # Get the role and content from the message
             role = message.get("role", "")
-            content = message.get("content", "")
+            text = _extract_text(message.get("content"))
+            if text:
+                segments.append((role, text))
+            # Assistant tool calls carry user/model text in the function arguments.
+            for tool_call in message.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                args = (tool_call.get("function") or {}).get("arguments")
+                if isinstance(args, str) and args:
+                    segments.append((role, args))
 
-            if not content:
-                continue
-            if isinstance(content, list):
-                content_to_check: str = ""
-                for text in content:
-                    content_to_check += f"\n{text['text']}"
-            elif isinstance(content, str):
-                content_to_check = content
-            else:
-                continue
-            # Check this message's content
+        for role, text in segments:
             result = await self.check_content(
-                content_to_check, fields=["content", f"{role}_content"]
+                text, fields=["content", f"{role}_content"]
             )
             if result.is_violation:
                 return result

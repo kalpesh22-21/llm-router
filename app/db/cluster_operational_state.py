@@ -568,18 +568,20 @@ class ClusterMetricsStore:
         except Exception as e:
             logger.error(
                 "Check-and-reserve script failed for %s/%s: %s. "
-                "Falling back to non-atomic reserve.",
+                "Rejecting reservation (fail-closed).",
                 model_id,
                 cluster_id,
                 e,
             )
-            # Fallback: try to reserve without atomic check
-            # This is a safety measure if Redis script fails
-            new_count = await self.reserve_tokens(model_id, cluster_id, tokens)
+            # Fail closed: a non-atomic INCRBY fallback would bypass both the
+            # capacity ceiling and the enabled/disabled check, admitting traffic
+            # to a full or drained cluster. Instead return failure so the caller
+            # surfaces a retryable 503 rather than silently waving the request
+            # past admission control.
             return {
-                "success": True,
-                "inflight_tokens": new_count,
-                "error": None,
+                "success": False,
+                "inflight_tokens": 0,
+                "error": "script_error",
             }
 
     async def release_tokens(self, model_id: str, cluster_id: str, tokens: int) -> int:

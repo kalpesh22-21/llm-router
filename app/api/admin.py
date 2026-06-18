@@ -36,9 +36,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
+import redis.asyncio as aioredis
 
 from app.api.auth_routes import get_current_user
-from app.auth.ldap_auth import get_ldap_user_info, verify_ldap_user_exists
+from app.auth.ldap_auth import verify_ldap_user_exists
 from app.backends.base import registry as backend_registry
 from app.db.cluster_drain import (
     DrainState,
@@ -49,6 +50,11 @@ from app.db.cluster_drain import (
 )
 from app.db.cluster_operational_state import cluster_metrics_store
 from app.db.mysql import Bucket, ContentFilterRule, User, get_db
+from app.db.redis_client import (
+    get_redis,
+    mark_user_deactivated,
+    unmark_user_deactivated,
+)
 from app.services.cluster_manager import ClusterCreate, ClusterUpdate, cluster_manager
 from app.services.content_filter import content_filter_service
 from app.services.permission import permission_service
@@ -313,11 +319,11 @@ async def create_user(
             "Only LDAP users can be added to the system.",
         )
 
+    # Email comes from the request if provided, otherwise left null. We cannot
+    # look it up here: get_ldap_user_info() binds *as the user*, and the admin
+    # does not have the user's password. The email is backfilled from LDAP on the
+    # user's first login (that flow has the real password).
     email = body.email
-    if email is None:
-        ldap_info = get_ldap_user_info(body.username)
-        if ldap_info and isinstance(ldap_info, dict):
-            email = ldap_info.get("email")
 
     user = await permission_service.create_user(
         db,
@@ -347,11 +353,33 @@ async def set_user_active(
     body: SetActiveRequest,
     admin: Annotated[User, Depends(require_admin)],
     db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
 ) -> UserResponse:
     """Activate or deactivate a user account."""
     user = await permission_service.set_user_active(
         db, user_id=user_id, is_active=body.is_active, by_user_id=admin.id
     )
+
+    # Tier 1 revocation: publish the status change to Redis immediately. Every
+    # proxied request already checks is_user_marked_deactivated(), so a
+    # deactivated user is rejected on their very next request instead of waiting
+    # for the ~1% random DB poll to discover it; on reactivation we clear the
+    # flag. The DB stays the source of truth: if the commit (in get_db, after
+    # this returns) fails, _resolve_user reconciles the flag against the DB on
+    # the next flagged request. A Redis error here must not fail the admin
+    # action — the random poll remains a backstop.
+    try:
+        if body.is_active:
+            await unmark_user_deactivated(redis, user_id)
+        else:
+            await mark_user_deactivated(redis, user_id, user.username)
+    except Exception:
+        logger.exception(
+            "Failed to update Redis deactivation flag for user_id=%s "
+            "(DB change still applied; random poll remains a backstop)",
+            user_id,
+        )
+
     return UserResponse.model_validate(user)
 
 
@@ -1002,7 +1030,7 @@ async def test_content_filter(
     db: AsyncSession = Depends(get_db),
 ) -> TestContentFilterResponse:
     """Test content against active filter rules without applying changes."""
-    result = await content_filter_service.check_content(db, body.content)
+    result = await content_filter_service.check_content(body.content)
     return TestContentFilterResponse(
         is_violation=result.is_violation,
         rule_name=result.rule_name,

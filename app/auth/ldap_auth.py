@@ -19,6 +19,7 @@ from typing import Dict, Optional
 import ldap3
 from ldap3.core.exceptions import LDAPBindError, LDAPException, LDAPOperationResult
 from ldap3.utils.dn import escape_rdn
+from ldap3.utils.conv import escape_filter_chars
 
 from app.core.config import get_settings
 
@@ -73,6 +74,12 @@ def authenticate_ldap(username: str, password: str) -> bool:
     # Escape username and password to prevent LDAP injection
     escaped_username = _escape_ldap_username(username)
     escaped_password = _escape_ldap_password(password)
+
+    # Reject if escaping reduced either credential to empty. An empty SIMPLE-bind
+    # password is treated as an anonymous/unauthenticated bind by many servers,
+    # which would otherwise let a control-character-only password authenticate.
+    if not escaped_username or not escaped_password:
+        return False
 
     # Attempt user bind to verify password
     try:
@@ -132,7 +139,7 @@ def check_if_user_has_access(
         allowed_groups = [allowed_groups]
 
     if isinstance(allowed_individuals, str):
-        allowed_groups = [allowed_individuals]
+        allowed_individuals = [allowed_individuals]
 
     ldap_username_user = ldap_conn.get_username_of_user()
 
@@ -164,6 +171,10 @@ def get_ldap_user_info(username: str, password: str) -> Dict[str, str]:
     escaped_password = _escape_ldap_password(password)
 
     result: Dict[str, str] = {}
+    # Empty escaped credentials would attempt an anonymous bind — bail out with
+    # an empty dict (the documented "user not found / unreachable" return).
+    if not escaped_username or not escaped_password:
+        return result
     try:
         user_conn = ldap.Ldap(
             username=escaped_username,
@@ -174,10 +185,10 @@ def get_ldap_user_info(username: str, password: str) -> Dict[str, str]:
         logger.debug("LDAP authentication succeeded for user %r", username)
     except LDAPBindError:
         logger.debug("LDAP authentication failed for user %r (bad password)", username)
-        return False
+        return {}
     except LDAPException as exc:
         logger.error("LDAP authentication error for user %r: %s", username, exc)
-        return False
+        return {}
     name = user_conn._whoami(username=username)
     result["email"] = user_conn.get_email_of_user(name=name)
     return result
@@ -193,8 +204,9 @@ def verify_ldap_user_exists(username: str) -> bool:
     if not username:
         return False
 
-    # Escape username to prevent LDAP injection
-    escaped_username = _escape_ldap_username(username)
+    # Escape username for use in an LDAP *search filter* (escape_filter_chars,
+    # not escape_rdn which is for DNs) to prevent filter injection.
+    escaped_username = escape_filter_chars(username)
 
     try:
         # Use service account to search for the user
@@ -206,7 +218,7 @@ def verify_ldap_user_exists(username: str) -> bool:
             auto_bind=True,
             raise_exceptions=True,
         )
-        search_filter = f"(&(objectClass=person)(uid={escaped_username})"
+        search_filter = f"(&(objectClass=person)(uid={escaped_username}))"
         # Search for the user
         service_conn.search(
             search_base="DC=paycomhq,DC=com",

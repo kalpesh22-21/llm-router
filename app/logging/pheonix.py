@@ -177,7 +177,12 @@ class Tracing:
                 ) as span:
                     try:
                         session_id = kwargs.get("session_id")
-                        span.set_attribute(SpanAttributes.SESSION_ID, session_id)
+                        # Only set the attribute when present — writing a None
+                        # span attribute is invalid (and version-dependently can
+                        # raise). No route currently supplies session_id, so this
+                        # simply stays unset rather than erroring on every request.
+                        if session_id is not None:
+                            span.set_attribute(SpanAttributes.SESSION_ID, session_id)
                         kwargs_dict = await self.convert_args_to_kwargs(
                             span_kind, func, args, kwargs
                         )

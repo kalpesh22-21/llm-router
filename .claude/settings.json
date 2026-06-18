@@ -21,7 +21,29 @@
       "Bash(curl -s http://localhost:8000/ui/)",
       "Bash(docker ps --format \"table {{.Names}}\\\\t{{.Status}}\")",
       "Bash(curl -s http://localhost:8000/ui/style.css)",
-      "Bash(curl -s http://localhost:8000/ui/app.js)"
+      "Bash(curl -s http://localhost:8000/ui/app.js)",
+      "Bash(python3 -c \"import starlette; print\\(starlette.__version__\\)\")",
+      "Bash(python3 -c \"from starlette.middleware.base import _StreamingResponse; print\\('exists'\\)\")",
+      "Bash(python3 -c \"import inspect, starlette.middleware.base as m; print\\([x for x in dir\\(m\\) if 'stream' in x.lower\\(\\) or 'Stream' in x]\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python -m py_compile app/core/config.py)",
+      "Bash(python3 -m py_compile app/api/auth_routes.py)",
+      "Bash(python3 -m py_compile app/services/content_filter.py)",
+      "Bash(awk 'NR>=520 && NR<=600 && /def /{print NR\": \"$0}' app/services/cross_pod_sync_service.py)",
+      "Bash(python3 -m py_compile app/services/cross_pod_sync_service.py)",
+      "Bash(python3 -m py_compile app/db/cluster_operational_state.py)",
+      "Bash(python3 -m py_compile app/main.py)",
+      "Bash(python3 -m py_compile app/logging/pheonix.py)",
+      "Bash(python3 -m py_compile app/services/permission.py)",
+      "Bash(python3 -m py_compile app/auth/ldap_auth.py)",
+      "Bash(python3 -m py_compile app/api/admin.py)",
+      "Bash(python3 -m py_compile app/db/redis_client.py)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python3 -m py_compile app/api/proxy.py)",
+      "WebFetch(domain:docs.vllm.ai)",
+      "Bash(python3 -m py_compile app/api/proxy.py app/auth/jwt_handler.py)"
     ]
   }
 }

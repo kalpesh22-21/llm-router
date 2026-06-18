@@ -9,7 +9,7 @@ Tokens are signed with HMAC-SHA256 (HS256) and contain the payload:
   - accessible_models        : list[str] (models user can access)
   - exp                      : expiry timestamp (UTC)
 
-Note: is_active is NOT in the token - we check DB randomly once in 10 requests
+Note: is_active is NOT in the token - we check DB randomly ~1% of requests
       to catch deactivated users while avoiding DB calls on every request.
 """
 

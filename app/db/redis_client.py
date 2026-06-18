@@ -85,23 +85,41 @@ async def increment_concurrent(redis: aioredis.Redis, user_id: int) -> int:
     return int(results[0])
 
 
+# Atomic decrement-floor-at-zero + TTL refresh in a single round-trip, so a
+# concurrent atomic INCR can never land between the DECR and the cleanup DELETE
+# (which would otherwise wipe that increment and leak the request's slot).
+# KEYS[1] = "concurrent:{user_id}"; ARGV[1] = TTL seconds. Returns count after decr.
+_DECREMENT_LUA = """
+local key = KEYS[1]
+local ttl = tonumber(ARGV[1])
+local v = redis.call('DECR', key)
+if v < 0 then
+    redis.call('DEL', key)
+    return 0
+end
+redis.call('EXPIRE', key, ttl)
+return v
+"""
+
+
 async def decrement_concurrent(redis: aioredis.Redis, user_id: int) -> int:
     """
     Atomically decrement the in-flight counter for *user_id*.
 
     The counter will not drop below 0 — if DECR would produce a negative
-    value the key is deleted instead.
+    value the key is deleted instead. The whole decrement / floor / TTL-refresh
+    runs as one Lua script so it cannot interleave with the atomic increment.
 
     Returns the counter value *after* decrementing (minimum 0).
     """
     key = _make_key(user_id)
-    new_val = await redis.decr(key)
-    if new_val < 0:
-        await redis.delete(key)
-        return 0
-    # Refresh TTL
-    await redis.expire(key, CONCURRENT_TTL_SECONDS)
-    return int(new_val)
+    result = await redis.eval(  # type: ignore[misc]
+        _DECREMENT_LUA,
+        1,  # number of keys
+        key,
+        CONCURRENT_TTL_SECONDS,
+    )
+    return int(result)
 
 
 async def get_concurrent(redis: aioredis.Redis, user_id: int) -> int:

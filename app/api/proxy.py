@@ -65,7 +65,7 @@ async def _resolve_user(
 
     Checks DB for is_active status:
     - Always if user is in the deactivated tracking set (was previously deactivated)
-    - Randomly (~10% of requests) for other users to catch newly deactivated users
+    - Randomly (~1% of requests) for other users to catch newly deactivated users
 
     If a deactivated user is found, they are added to the tracking set.
     If a tracked user is found active again, they are removed from tracking.
@@ -83,7 +83,7 @@ async def _resolve_user(
     # Check if user is in the deactivated tracking set
     is_tracked_deactivated = await is_user_marked_deactivated(redis, user_id)
 
-    # Always check DB if user was previously deactivated, otherwise random 10% check
+    # Always check DB if user was previously deactivated, otherwise random 1% check
     should_check_db = is_tracked_deactivated or (random.random() < 0.01)
 
     if should_check_db:
@@ -233,7 +233,12 @@ async def _stream_response(
                 token_counter += 1
                 yield f"data: {json.dumps(parsed)}\n\n".encode()
             else:
-                yield f"data: [DONE]"
+                # parsed is None: either the upstream [DONE] sentinel (is_last)
+                # or an un-parseable keepalive/comment line. Forward one
+                # well-formed [DONE] for the sentinel; skip the rest rather than
+                # emitting spurious/malformed terminators mid-stream.
+                if is_last:
+                    yield b"data: [DONE]\n\n"
 
     except httpx.HTTPStatusError as exc:
         http_status = str(exc.response.status_code)

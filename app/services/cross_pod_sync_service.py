@@ -574,7 +574,7 @@ class CrossPodSyncService:
                     endpoint.is_enabled != new_is_enabled
                     or endpoint.auto_adapt_capacity != new_auto_adapt
                 ):  
-                    with endpoint.update_lock:
+                    async with endpoint.update_lock:
                         old_enabled = endpoint.is_enabled
                         old_auto_adapt = endpoint.auto_adapt_capacity
 

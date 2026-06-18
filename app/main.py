@@ -142,6 +142,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application startup and shutdown."""
     logger.info("=== LLM Router starting up ===")
 
+    # 0. Register graceful-shutdown signal handlers now that the event loop is
+    # running and uvicorn's handlers are installed (so they can be chained).
+    setup_signal_handlers()
+
     # 1. Init Redis first (required by other services)
     try:
         await init_redis()
@@ -285,8 +289,10 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Setup signal handlers for graceful shutdown
-    setup_signal_handlers()
+    # NOTE: signal handlers are registered inside the lifespan startup (not here)
+    # so that a running event loop exists and uvicorn's own handlers are already
+    # installed to chain to. Registering at create_app() time captured _loop=None,
+    # which silently disabled the graceful drain.
 
     # ------------------------------------------------------------------ #
     # Routers
