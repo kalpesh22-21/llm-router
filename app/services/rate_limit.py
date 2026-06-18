@@ -15,8 +15,7 @@ from fastapi import HTTPException, status
 from app.db.redis_client import (
     CONCURRENT_TTL_SECONDS,
     decrement_concurrent,
-    get_concurrent,
-    increment_concurrent,
+    get_concurrent
 )
 
 logger = logging.getLogger(__name__)

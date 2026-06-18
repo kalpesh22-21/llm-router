@@ -18,7 +18,7 @@ settings = get_settings()
 # TTL (seconds) applied every time the counter is touched.
 # Acts as a safety net: if the router crashes without decrementing,
 # the key expires within CONCURRENT_TTL_SECONDS seconds.
-CONCURRENT_TTL_SECONDS: int = 300
+CONCURRENT_TTL_SECONDS: int = settings.CONCURRENT_TTL_SECONDS
 
 _REDIS_POOL: Optional[aioredis.Redis] = None  # module-level singleton
 
@@ -27,11 +27,15 @@ def _make_key(user_id: int) -> str:
     return f"concurrent:{user_id}"
 
 
+def _make_url(host: str, port: int) -> str:
+    return f"redis://{host}:{port}/0"
+
+
 async def init_redis() -> None:
     """Create the module-level Redis connection pool (called at startup)."""
     global _REDIS_POOL
     _REDIS_POOL = aioredis.from_url(
-        settings.REDIS_URL,
+        _make_url(host=settings.REDIS_HOST, port=settings.REDIS_PORT),
         encoding="utf-8",
         decode_responses=True,
     )
@@ -48,7 +52,9 @@ async def close_redis() -> None:
 def get_redis_pool() -> aioredis.Redis:
     """Return the module-level Redis pool, raising if not initialised."""
     if _REDIS_POOL is None:
-        raise RuntimeError("Redis pool has not been initialised. Call init_redis() first.")
+        raise RuntimeError(
+            "Redis pool has not been initialised. Call init_redis() first."
+        )
     return _REDIS_POOL
 
 
@@ -103,3 +109,38 @@ async def get_concurrent(redis: aioredis.Redis, user_id: int) -> int:
     key = _make_key(user_id)
     val = await redis.get(key)
     return int(val) if val is not None else 0
+
+
+# ---------------------------------------------------------------------------
+# Deactivated users tracking helpers
+# ---------------------------------------------------------------------------
+# Users found to be deactivated are tracked in Redis so we always check
+# them on subsequent requests until they are reactivated.
+
+DEACTIVATED_USERS_KEY = "deactivated_users"
+DEACTIVATED_USER_TTL_SECONDS: int = 604800  # 1 week
+
+
+async def mark_user_deactivated(
+    redis: aioredis.Redis, user_id: int, username: str
+) -> None:
+    """
+    Mark a user as deactivated in Redis.
+
+    This ensures the user is always checked against DB on subsequent requests
+    until they are reactivated.
+    """
+    # Use a hash to store user_id -> username mapping
+    await redis.hset(DEACTIVATED_USERS_KEY, str(user_id), username)
+    # Set TTL on the hash key
+    await redis.expire(DEACTIVATED_USERS_KEY, DEACTIVATED_USER_TTL_SECONDS)
+
+
+async def unmark_user_deactivated(redis: aioredis.Redis, user_id: int) -> None:
+    """Remove a user from the deactivated tracking (called when user is reactivated)."""
+    await redis.hdel(DEACTIVATED_USERS_KEY, str(user_id))
+
+
+async def is_user_marked_deactivated(redis: aioredis.Redis, user_id: int) -> bool:
+    """Check if a user is in the deactivated tracking set."""
+    return await redis.hexists(DEACTIVATED_USERS_KEY, str(user_id))

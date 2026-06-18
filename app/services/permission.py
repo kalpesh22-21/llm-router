@@ -7,21 +7,25 @@ issue raw SQL or ORM queries directly against the permission tables.
 
 from __future__ import annotations
 
-import asyncio
+import json
 import logging
-import random
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import joinedload, selectinload
 
-from app.auth.ldap_auth import ldap_user_exists
+from app.core.config import get_settings
 from app.db.mysql import Bucket, BucketModel, User, UserBucketAccess
+from app.db.redis_client import get_redis_pool
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
+
+# Redis cache key for default model (no TTL — cache only invalidated on explicit write)
+DEFAULT_MODEL_CACHE_KEY = "default_model"
 
 
 class PermissionService:
@@ -54,10 +58,48 @@ class PermissionService:
         result = await db.execute(select(User).where(User.username == username))
         return result.scalar_one_or_none()
 
-    async def list_users(self, db: AsyncSession) -> List[User]:
-        """Return all users ordered by id."""
-        result = await db.execute(select(User).order_by(User.id))
-        return list(result.scalars().all())
+    async def list_users(
+        self,
+        db: AsyncSession,
+        skip: int = 0,
+        limit: int = 20,
+        search: Optional[str] = None,
+    ) -> Tuple[List[User], int]:
+        """
+        Return paginated users ordered by id.
+
+        Args:
+            db: Database session
+            skip: Number of records to skip (offset)
+            limit: Maximum number of records to return
+            search: Optional search query for username/email
+
+        Returns:
+            Tuple of (users list, total count)
+        """
+        # Build base query
+        query = select(User)
+        count_query = select(func.count()).select_from(User)
+
+        # Apply search filter if provided
+        if search:
+            search_pattern = f"%{search}%"
+            filter_condition = User.username.ilike(search_pattern) | User.email.ilike(
+                search_pattern
+            )
+            query = query.where(filter_condition)
+            count_query = count_query.where(filter_condition)
+
+        # Get total count
+        count_result = await db.execute(count_query)
+        total = count_result.scalar_one()
+
+        # Execute paginated query
+        query = query.order_by(User.id).offset(skip).limit(limit)
+        result = await db.execute(query)
+        users = list(result.scalars().all())
+
+        return users, total
 
     async def create_user(
         self,
@@ -115,8 +157,9 @@ class PermissionService:
         user = await self.get_user(db, user_id)
         user.is_active = is_active
         await db.flush()
+        by_user = await self.get_user(db, by_user_id)
         logger.info(
-            "User %d set is_active=%s by user %d", user_id, is_active, by_user_id
+            "User %s set is_active=%s by user %s", user.username, is_active, by_user.username
         )
         return user
 
@@ -131,12 +174,25 @@ class PermissionService:
         Grant or revoke admin status.
 
         Requires the caller to be an admin (enforced by the route layer).
+        Only the superuser can remove admin status from a user.
         """
         user = await self.get_user(db, user_id)
+
+        # Check if we're trying to remove admin status
+        if user.is_admin and not is_admin:
+            # Only superuser can remove admin status
+            by_user = await self.get_user(db, by_user_id)
+            if by_user.username != settings.SUPERUSER_USERNAME:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Only the superuser can remove admin privileges",
+                )
+
         user.is_admin = is_admin
         await db.flush()
+        by_user = await self.get_user(db, by_user_id)
         logger.info(
-            "User %d set is_admin=%s by admin %d", user_id, is_admin, by_user_id
+            "User %s set is_admin=%s by admin %s", user.username, is_admin, by_user.username
         )
         return user
 
@@ -156,11 +212,12 @@ class PermissionService:
         user = await self.get_user(db, user_id)
         user.max_concurrent_requests = max_concurrent
         await db.flush()
+        by_user = await self.get_user(db, by_user_id)
         logger.info(
-            "User %d max_concurrent set to %d by user %d",
-            user_id,
+            "User %s max_concurrent set to %d by user %s",
+            user.username,
             max_concurrent,
-            by_user_id,
+            by_user.username,
         )
         return user
 
@@ -172,66 +229,90 @@ class PermissionService:
         hold a valid JWT. Randomly (~10% of calls) also verifies the user
         still exists in LDAP; if not, the user is auto-deactivated.
         """
-        result = await db.execute(
-            select(User.is_active, User.username).where(User.id == user_id)
-        )
+        result = await db.execute(select(User.is_active).where(User.id == user_id))
         row = result.one_or_none()
         if row is None:
             return False
-        is_active, username = row
+        is_active = row
 
         if not is_active:
             return False
-
-        # Probabilistic LDAP existence check (~10% of requests)
-        if random.random() < 0.1:
-            loop = asyncio.get_event_loop()
-            exists = await loop.run_in_executor(None, ldap_user_exists, username)
-            if exists is False:
-                # User was deprovisioned from LDAP — auto-deactivate
-                logger.warning(
-                    "User %r (id=%d) no longer exists in LDAP; deactivating",
-                    username,
-                    user_id,
-                )
-                user = await self.get_user(db, user_id)
-                user.is_active = False
-                await db.flush()
-                return False
-            elif exists is None:
-                # LDAP unreachable — fail open, log a warning
-                logger.warning(
-                    "LDAP unreachable during existence check for user %r (id=%d); skipping",
-                    username,
-                    user_id,
-                )
-
         return True
 
     # ------------------------------------------------------------------ #
     # Model access helpers
     # ------------------------------------------------------------------ #
 
-    async def get_user_bucket_ids(self, db: AsyncSession, user_id: int) -> List[int]:
+    async def get_user_bucket_ids(
+        self, db: AsyncSession, user_id: int, available_model_ids: Optional[set] = None
+    ) -> List[int]:
         """Return the list of bucket IDs the user currently has access to."""
+        default_bucket: Optional[Bucket] = await self.get_default_bucket(db=db)
         result = await db.execute(
-            select(UserBucketAccess.bucket_id).where(UserBucketAccess.user_id == user_id)
+            select(UserBucketAccess.bucket_id).where(
+                UserBucketAccess.user_id == user_id
+            )
         )
-        return [row[0] for row in result.all()]
+        bucket_ids_within_user_access = set([row[0] for row in result.all()])
+        if default_bucket:
+            bucket_ids_within_user_access.add(default_bucket.id)
+
+        # If available_model_ids provided, filter to only buckets where ALL models are available
+        if available_model_ids is not None:
+            # Get all buckets with their models
+            result = await db.execute(
+                select(Bucket)
+                .options(selectinload(Bucket.models))
+                .where(Bucket.id.in_(bucket_ids_within_user_access))
+            )
+            buckets = result.scalars().all()
+
+            valid_bucket_ids = set()
+            for bucket in buckets:
+                bucket_model_ids = {model.model_id for model in bucket.models}
+                if bucket_model_ids and bucket_model_ids.intersection(
+                    available_model_ids
+                ):
+                    valid_bucket_ids.add(bucket.id)
+
+            return list(valid_bucket_ids)
+
+        return list(bucket_ids_within_user_access)
 
     async def get_user_accessible_models(
-        self, db: AsyncSession, user_id: int
+        self, db: AsyncSession, user_id: int, available_model_ids: Optional[set] = None
     ) -> List[str]:
         """
         Return all model_ids accessible to *user_id* via their bucket grants.
+
+        Only returns models from buckets where ALL models in the bucket are available
+        in the backend.
         """
+        default_model_id = await self.get_default_model(db=db)
+        default_bucket = await self.get_default_bucket(db=db)
         result = await db.execute(
-            select(BucketModel.model_id)
-            .join(UserBucketAccess, UserBucketAccess.bucket_id == BucketModel.bucket_id)
-            .where(UserBucketAccess.user_id == user_id)
-            .distinct()
+            select(UserBucketAccess.bucket_id).where(
+                UserBucketAccess.user_id == user_id
+            )
         )
-        return [row[0] for row in result.all()]
+        bucket_ids = set([row[0] for row in result.all()])
+        if default_bucket:
+            bucket_ids.add(default_bucket.id)
+
+        result = await db.execute(
+            select(Bucket)
+            .options(selectinload(Bucket.models))
+            .where(Bucket.id.in_(bucket_ids))
+        )
+        buckets = result.scalars().all()
+        valid_model_ids: set = {default_model_id} if default_model_id else set()
+        for bucket in buckets:
+            bucket_model_ids = {model.model_id for model in bucket.models}
+            if bucket_model_ids:
+                valid_model_ids.update(
+                    bucket_model_ids.intersection(available_model_ids)
+                )
+        return list(valid_model_ids)
 
     # ------------------------------------------------------------------ #
     # Bucket access helpers
@@ -246,7 +327,7 @@ class PermissionService:
     ) -> UserBucketAccess:
         """Grant *user_id* access to *bucket_id*. Idempotent."""
         # Verify both user and bucket exist
-        await self.get_user(db, user_id)
+        user = await self.get_user(db, user_id)
         await self._get_bucket(db, bucket_id)
 
         # Check for existing grant
@@ -267,11 +348,12 @@ class PermissionService:
         )
         db.add(access)
         await db.flush()
+        by_user = await self.get_user(db, by_user_id)
         logger.info(
-            "Granted user %d access to bucket %d by user %d",
-            user_id,
+            "Granted user %s access to bucket %d by user %s",
+            user.username,
             bucket_id,
-            by_user_id,
+            by_user.username,
         )
         return access
 
@@ -293,11 +375,13 @@ class PermissionService:
         if access is not None:
             await db.delete(access)
             await db.flush()
+            user = await self.get_user(db, user_id)
+            by_user = await self.get_user(db, by_user_id)
             logger.info(
-                "Revoked user %d access to bucket %d by user %d",
-                user_id,
+                "Revoked user %s access to bucket %d by user %s",
+                user.username,
                 bucket_id,
-                by_user_id,
+                by_user.username,
             )
 
     # ------------------------------------------------------------------ #
@@ -328,24 +412,77 @@ class PermissionService:
             db.add(BucketModel(bucket_id=bucket.id, model_id=model_id))
         await db.flush()
 
-        logger.info("Bucket %r (id=%d) created by user %d", name, bucket.id, by_user_id)
+        by_user = await self.get_user(db, by_user_id)
+        logger.info("Bucket %r (id=%d) created by user %s", name, bucket.id, by_user.username)
         return bucket
 
-    async def list_buckets(self, db: AsyncSession) -> List[Bucket]:
-        """Return all buckets with their model lists eagerly loaded."""
+    async def get_default_model(self, db: AsyncSession) -> Optional[str]:
+        """Return the default model ID from the default bucket, or None.
+        
+        Cached in Redis with no TTL — only invalidated when explicitly set/cleared.
+        """
+        try:
+            redis = get_redis_pool()
+            cached = await redis.get(DEFAULT_MODEL_CACHE_KEY)
+            if cached is not None:
+                return json.loads(cached) if cached != 'null' else None
+        except Exception:
+            pass  # Redis unavailable, fall through to DB
+        
         result = await db.execute(
             select(Bucket)
-            .options(selectinload(Bucket.models))
-            .order_by(Bucket.id)
+            .options(joinedload(Bucket.models))
+            .where(Bucket.is_default == True)  # noqa: E712
         )
-        return list(result.scalars().all())
+        bucket = result.unique().scalar_one_or_none()
+        if bucket is None:
+            model = None
+        else:
+            model = bucket.default_model
+        
+        # Cache result (including None) with no TTL so it persists until explicit invalidation
+        try:
+            redis = get_redis_pool()
+            await redis.set(DEFAULT_MODEL_CACHE_KEY, json.dumps(model))
+        except Exception:
+            pass
+        
+        return model
 
-    async def get_default_bucket(self, db: AsyncSession) -> Optional[Bucket]:
-        """Return the bucket marked is_default=True, or None."""
-        result = await db.execute(
-            select(Bucket).where(Bucket.is_default == True)  # noqa: E712
+    async def set_default_model(
+        self,
+        db: AsyncSession,
+        bucket_id: int,
+        model_id: str,
+        by_user_id: int,
+    ) -> Bucket:
+        """Set a specific model as the default model on the bucket."""
+        bucket = await self._get_bucket(db, bucket_id)
+        
+        # Validate the model_id belongs to this bucket
+        bucket_model_ids = {m.model_id for m in bucket.models}
+        if bucket_model_ids and model_id not in bucket_model_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Model {model_id!r} is not in bucket {bucket_id!r}. Available models: {sorted(bucket_model_ids)}",
+            )
+        
+        bucket.default_model = model_id
+        await db.flush()
+
+        # Invalidate cache so next /v1/models fetches fresh value
+        try:
+            redis = get_redis_pool()
+            await redis.delete(DEFAULT_MODEL_CACHE_KEY)
+        except Exception:
+            pass
+        
+        by_user = await self.get_user(db, by_user_id)
+        logger.info(
+            "Model %r set as default model on bucket %d by user %s",
+            model_id, bucket_id, by_user.username
         )
-        return result.scalar_one_or_none()
+        return bucket
 
     async def set_default_bucket(
         self,
@@ -359,7 +496,9 @@ class PermissionService:
         Only one bucket may be the default at any time.
         """
         # Clear existing default(s)
-        result = await db.execute(select(Bucket).where(Bucket.is_default == True))  # noqa: E712
+        result = await db.execute(
+            select(Bucket).where(Bucket.is_default == True)
+        )  # noqa: E712
         for existing in result.scalars().all():
             existing.is_default = False
 
@@ -368,10 +507,134 @@ class PermissionService:
         new_default.is_default = True
         await db.flush()
 
-        logger.info(
-            "Bucket %d set as default by user %d", bucket_id, by_user_id
-        )
+        # Invalidate default model cache - the default bucket changed
+        try:
+            redis = get_redis_pool()
+            await redis.delete(DEFAULT_MODEL_CACHE_KEY)
+        except Exception:
+            pass
+        
+        by_user = await self.get_user(db, by_user_id)
+        logger.info("Bucket %d set as default by user %s", bucket_id, by_user.username)
         return new_default
+
+    async def update_bucket(
+        self,
+        db: AsyncSession,
+        bucket_id: int,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        model_ids: Optional[List[str]] = None,
+        by_user_id: int = None,
+    ) -> Bucket:
+        """
+        Update a bucket's name, description, and/or model assignments.
+
+        Args:
+            db: Database session
+            bucket_id: ID of the bucket to update
+            name: New bucket name (optional)
+            description: New bucket description (optional)
+            model_ids: Complete list of model IDs to assign (optional, replaces all existing)
+            by_user_id: ID of the user making the change (for audit logging)
+
+        Returns:
+            Updated Bucket object
+
+        Raises:
+            HTTPException(404) if bucket not found
+            HTTPException(409) if name conflicts with another bucket
+        """
+        # Fetch the bucket to update
+        bucket = await self._get_bucket(db, bucket_id)
+
+        # Track changes for audit log
+        changes = []
+
+        # Update name if provided
+        if name is not None and name != bucket.name:
+            # Check for duplicate name (excluding current bucket)
+            result = await db.execute(
+                select(Bucket).where(
+                    Bucket.name == name,
+                    Bucket.id != bucket_id
+                )
+            )
+            existing = result.scalar_one_or_none()
+            if existing is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Bucket with name {name!r} already exists",
+                )
+            old_name = bucket.name
+            bucket.name = name
+            changes.append(f"name: {old_name!r} -> {name!r}")
+
+        # Update description if provided
+        if description is not None and description != bucket.description:
+            old_desc = bucket.description
+            bucket.description = description
+            changes.append(f"description: {old_desc!r} -> {description!r}")
+
+        # Update model assignments if provided (replaces all existing)
+        if model_ids is not None:
+            # Fetch current models for comparison
+            result = await db.execute(
+                select(BucketModel).where(BucketModel.bucket_id == bucket_id)
+            )
+            current_models = {m.model_id for m in result.scalars().all()}
+            new_models = set(model_ids)
+
+            if current_models != new_models:
+                # Delete all existing model assignments
+                await db.execute(
+                    BucketModel.__table__.delete().where(
+                        BucketModel.bucket_id == bucket_id
+                    )
+                )
+                # Add new model assignments
+                for model_id in model_ids:
+                    db.add(BucketModel(bucket_id=bucket_id, model_id=model_id))
+
+                changes.append(
+                    f"models: {sorted(current_models)} -> {sorted(new_models)}"
+                )
+
+        # Flush changes to the database
+        if changes:
+            try:
+                await db.flush()
+            except IntegrityError:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Bucket update failed due to constraint violation",
+                )
+
+            # Log the changes
+            by_user = await self.get_user(db, by_user_id)
+            logger.info(
+                "Bucket %d updated by user %s: %s",
+                bucket_id,
+                by_user.username,
+                "; ".join(changes),
+            )
+
+        return bucket
+
+    async def get_default_bucket(self, db: AsyncSession) -> Optional[Bucket]:
+        """Return the bucket marked as default, or None if no default exists."""
+        result = await db.execute(
+            select(Bucket).options(selectinload(Bucket.models)).where(Bucket.is_default == True)
+        )  # noqa: E712
+        return result.unique().scalar_one_or_none()
+
+    async def list_buckets(self, db: AsyncSession) -> List[Bucket]:
+        """Return all buckets with their models eager-loaded."""
+        result = await db.execute(
+            select(Bucket).options(selectinload(Bucket.models))
+        )
+        return result.unique().scalars().all()
 
     async def count_users(self, db: AsyncSession) -> int:
         """Return total number of users in the database."""
@@ -383,7 +646,7 @@ class PermissionService:
     # ------------------------------------------------------------------ #
 
     async def _get_bucket(self, db: AsyncSession, bucket_id: int) -> Bucket:
-        result = await db.execute(select(Bucket).where(Bucket.id == bucket_id))
+        result = await db.execute(select(Bucket).options(selectinload(Bucket.models)).where(Bucket.id == bucket_id))
         bucket = result.scalar_one_or_none()
         if bucket is None:
             raise HTTPException(

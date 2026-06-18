@@ -8,11 +8,14 @@ plus the FastAPI dependency `get_db()`.
 from __future__ import annotations
 
 import datetime
+import logging
 from typing import AsyncGenerator
 
 from sqlalchemy import (
+    URL,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -20,6 +23,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    JSON,
+    text,
 )
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -27,8 +32,11 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+import sqlparse
 
 from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -36,12 +44,46 @@ settings = get_settings()
 # Engine & session factory
 # ---------------------------------------------------------------------------
 
+
+def _build_url(
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    db_name: str,
+    drivername: str,
+):
+    # return f"postgresql+psycopg://{user}:{password}@{host}:{port}/{db_name}"
+    connection_url = URL.create(
+        drivername=drivername,
+        username=user,
+        password=password,
+        host=host,
+        database=db_name,
+        port=port,  # Port is an integer
+    )
+    return connection_url
+
+
 engine = create_async_engine(
-    settings.DATABASE_URL,
+    _build_url(
+        host=settings.DATABASE_HOST,
+        port=settings.DATABASE_PORT,
+        user=settings.DATABASE_USER,
+        password=settings.DATABASE_PASSWORD,
+        db_name=settings.DATABASE_NAME,
+        drivername=settings.DATABASE_DRIVER,
+    ),
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=20,
     echo=False,
+)
+
+# Log database connection info (excluding password)
+logger.info(
+    f"Connecting to database: driver={settings.DATABASE_DRIVER}, "
+    f"database={settings.DATABASE_NAME}, user={settings.DATABASE_USER}"
 )
 
 AsyncSessionLocal = async_sessionmaker(
@@ -78,12 +120,16 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    username: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    username: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True, index=True
+    )
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Maximum number of simultaneous in-flight requests allowed for this user
-    max_concurrent_requests: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    max_concurrent_requests: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=10
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )
@@ -117,16 +163,22 @@ class Bucket(Base):
     __tablename__ = "buckets"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    name: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True, index=True
+    )
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    default_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )
 
     # Relationships
     models: Mapped[list[BucketModel]] = relationship(
-        "BucketModel", back_populates="bucket", lazy="select", cascade="all, delete-orphan"
+        "BucketModel",
+        back_populates="bucket",
+        lazy="select",
+        cascade="all, delete-orphan",
     )
     user_accesses: Mapped[list[UserBucketAccess]] = relationship(
         "UserBucketAccess", back_populates="bucket", lazy="select"
@@ -202,6 +254,177 @@ class UserBucketAccess(Base):
         return f"<UserBucketAccess user_id={self.user_id} bucket_id={self.bucket_id}>"
 
 
+class ContentFilterRule(Base):
+    """
+    Content filter rule for filtering user messages before they reach LLM backends.
+
+    Supports three types of filtering:
+    - REGEX: Pattern matching using regular expressions
+    - KEYWORD: Simple keyword matching
+    - EXTERNAL_URL: Check content via external API service
+    """
+
+    __tablename__ = "content_filter_rules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True, index=True
+    )
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rule_type: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    # For REGEX and KEYWORD types
+    pattern: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # For EXTERNAL_URL type
+    external_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # For EXTERNAL_URL type: extra parameters to include in the payload
+    extra_params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # For all types: comma-separated list of field names to check
+    fields_to_check: Mapped[str | None] = mapped_column(
+        String(1024), nullable=True, default="content"
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_blocking: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Violation message to show when content is blocked
+    violation_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    created_by: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_content_filter_rules_active", "is_active"),
+        Index("ix_content_filter_rules_type", "rule_type"),
+    )
+
+    # Relationships
+    creator: Mapped[User | None] = relationship("User", foreign_keys=[created_by])
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"<ContentFilterRule id={self.id} name={self.name!r} type={self.rule_type}>"
+        )
+
+
+class ModelCluster(Base):
+    """
+    Represents a model deployment cluster configuration.
+
+    Tracks cluster assignments for models, including capacity settings,
+    replica counts, and auto-scaling configuration. Each model can be
+    deployed across multiple clusters with different priorities.
+    """
+
+    __tablename__ = "model_clusters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    cluster_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    base_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    api_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    number_of_replicas: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    seed_capacity_tokens_per_pod: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    auto_adapt_capacity: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Performance tuning knobs
+    ttft_budget_ms: Mapped[float] = mapped_column(Float, nullable=False, default=500.0)
+    itl_budget_ms: Mapped[float] = mapped_column(Float, nullable=False, default=50.0)
+    ttft_alpha: Mapped[float] = mapped_column(Float, nullable=False, default=0.3)
+    itl_alpha: Mapped[float] = mapped_column(Float, nullable=False, default=0.3)
+    capacity_alpha: Mapped[float] = mapped_column(Float, nullable=False, default=0.1)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    # Timestamp of last YAML config load/synchronization
+    config_updated_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    updated_by: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint("model_id", "cluster_id", name="uq_model_cluster"),
+        Index("ix_model_clusters_cluster_id", "cluster_id"),
+        Index("ix_model_clusters_enabled", "is_enabled"),
+        Index("ix_model_clusters_model_enabled", "model_id", "is_enabled"),
+    )
+
+    # Relationships
+    updater: Mapped[User | None] = relationship("User", foreign_keys=[updated_by])
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"<ModelCluster id={self.id} model_id={self.model_id!r} "
+            f"cluster_id={self.cluster_id!r}>"
+        )
+
+
+class ModelClusterAuditLog(Base):
+    """
+    Audit log for model cluster configuration changes.
+
+    Tracks all modifications to model cluster assignments, including
+    capacity changes, replica updates, and enable/disable operations.
+    Stores before/after values as JSON for complete change history.
+    """
+
+    __tablename__ = "model_cluster_audit_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    cluster_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    action: Mapped[str] = mapped_column(String(50), nullable=False)
+    old_values: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    new_values: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    performed_by: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    performed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_model_cluster_audit_model_id", "model_id"),
+        Index("ix_model_cluster_audit_cluster_id", "cluster_id"),
+        Index("ix_model_cluster_audit_performed_at", "performed_at"),
+        Index(
+            "ix_model_cluster_audit_model_cluster",
+            "model_id",
+            "cluster_id",
+        ),
+    )
+
+    # Relationships
+    performer: Mapped[User | None] = relationship("User", foreign_keys=[performed_by])
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"<ModelClusterAuditLog id={self.id} model_id={self.model_id!r} "
+            f"cluster_id={self.cluster_id!r} action={self.action!r}>"
+        )
+
+
 # ---------------------------------------------------------------------------
 # FastAPI dependency
 # ---------------------------------------------------------------------------
@@ -224,3 +447,39 @@ async def create_all_tables() -> None:
     """Create all tables (used during application startup)."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+async def run_migrations() -> None:
+    """Run any runtime migrations that cannot be handled by create_all (e.g., adding columns to existing tables)."""
+    from sqlalchemy import inspect, text
+
+    async with engine.begin() as conn:
+
+        def _columns_missing(sync_conn):
+            inspector = inspect(sync_conn)
+            cols = [c["name"] for c in inspector.get_columns("buckets")]
+            missing = []
+            if "default_model" not in cols:
+                missing.append("default_model")
+            return missing
+
+        missing = await conn.run_sync(_columns_missing)
+
+        if "default_model" in missing:
+            logger.warning("Column 'default_model' missing from 'buckets', adding it now...")
+            dialect = conn.dialect.name
+            if dialect == "mysql":
+                alter_sql = (
+                    "ALTER TABLE buckets "
+                    "ADD COLUMN default_model VARCHAR(255) DEFAULT NULL "
+                    "AFTER is_default"
+                )
+            else:
+                alter_sql = (
+                    "ALTER TABLE buckets "
+                    "ADD COLUMN default_model VARCHAR(255) DEFAULT NULL"
+                )
+            await conn.execute(text(alter_sql))
+            logger.info("Column 'default_model' added to 'buckets' table")
+        else:
+            logger.info("Column 'default_model' already exists in 'buckets', skipping migration")

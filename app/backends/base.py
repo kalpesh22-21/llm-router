@@ -12,10 +12,13 @@ BackendRegistry is the single lookup point: model_id -> Backend instance.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import logging
 from typing import AsyncIterator, Dict, Optional
 
 import httpx
 from fastapi import Request
+
+logger = logging.getLogger(__name__)
 
 
 class Backend(ABC):
@@ -35,7 +38,7 @@ class Backend(ABC):
         ...
 
     @abstractmethod
-    async def forward(self, request: Request, body: dict) -> httpx.Response:
+    async def forward(self, request: Request, body: dict,upstream_url:str) -> httpx.Response:
         """
         Forward a non-streaming request to the backend.
 
@@ -50,7 +53,7 @@ class Backend(ABC):
 
     @abstractmethod
     async def forward_stream(
-        self, request: Request, body: dict
+        self, request: Request, body: dict,upstream_url:str
     ) -> AsyncIterator[bytes]:
         """
         Forward a streaming request to the backend.
@@ -82,9 +85,10 @@ class BackendRegistry:
     def register(self, backend: Backend) -> None:
         """Register a backend. Raises ValueError if model_id is already taken."""
         if backend.model_id in self._backends:
-            raise ValueError(
+            logger.warning(
                 f"Backend for model_id {backend.model_id!r} is already registered"
             )
+            return
         self._backends[backend.model_id] = backend
 
     def get(self, model_id: str) -> Optional[Backend]:

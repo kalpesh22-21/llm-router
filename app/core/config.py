@@ -26,14 +26,27 @@ Supported model entry shapes in models.yaml:
 
 from __future__ import annotations
 
+import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import Field, dataclass, field
 from functools import lru_cache
-from typing import List, Optional, Union
+from typing import Annotated, List, Optional, Union
 
 import yaml
-from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import (
+    AfterValidator,
+    Field,
+    field_validator,
+)
+from pydantic_settings import BaseSettings
+from paycompy import vault
+
+from app.utils.api_key_validator import find_working_api_key
+
+logger = logging.getLogger(__name__)
+
+
+StrippedString = Annotated[str, AfterValidator(lambda x: x.strip("\\n").strip("\n"))]
 
 
 class ModelConfig:
@@ -56,6 +69,10 @@ class ClusterConfig:
     cluster_id: str
     base_url: str
     api_key: str
+    number_of_replicas: int = 1  # Number of replicas for capacity calculation
+    is_enabled: bool = True  # Whether cluster is enabled
+    auto_adapt_capacity: bool = True  # Whether to auto-adapt capacity
+    priority: int = 0  # Priority rank for routing (higher = preferred)
 
 
 @dataclass
@@ -69,8 +86,8 @@ class RoutingConfig:
     # Spill to remotes when local load_ratio exceeds this
     spill_ratio: float = 0.8
 
-    # Starting capacity estimate before enough data is observed
-    seed_capacity_tokens: int = 200_000
+    # Starting capacity estimate per pod before enough data is observed
+    seed_capacity_tokens_per_pod: int = 40_000
 
     # Used when the request body omits max_tokens
     default_max_tokens: int = 2048
@@ -83,8 +100,8 @@ class RoutingConfig:
     itl_budget_ms: float = 80.0
 
     # EWMA smoothing factors
-    ttft_alpha: float = 0.1   # slow — queue depth changes gradually
-    itl_alpha: float = 0.2    # faster — decode saturation shows up quickly
+    ttft_alpha: float = 0.1  # slow — queue depth changes gradually
+    itl_alpha: float = 0.2  # faster — decode saturation shows up quickly
     capacity_alpha: float = 0.1  # slow upward drift when healthy
 
 
@@ -98,54 +115,244 @@ class MultiClusterModelConfig:
 
 
 class Settings(BaseSettings):
-    """Application settings loaded from environment variables / .env file."""
+    class Config:
+        env_file = os.getenv(
+            "LOCAL_ENV_PATH",
+            "/mnt/nfsdata/shreyan/gitlab/llm-router/develop/.env",
+        )
+        env_file_encoding = "utf-8"
+        case_sensitive = False
+        extra = "ignore"
+        # Allow environment variables to override defaults
+        env_override_prefix = ""
 
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=False,
-        extra="ignore",
+    PROJECT_NAME: str = Field(
+        default="LLM ROUTER",
+        description="Name of the project",
+        env="PROJECT_NAME",
+    )
+    # Database
+    DATABASE_USER: StrippedString = Field(
+        default="root",
+        description="Database username",
+        env="DATABASE_USER",
     )
 
-    # Database
-    DATABASE_URL: str = "mysql+aiomysql://root:password@localhost:3306/llm_router"
+    DATABASE_PASSWORD: StrippedString = Field(
+        default="password",
+        description="Database password",
+        env="DATABASE_PASSWORD",
+    )
+
+    DATABASE_HOST: StrippedString = Field(
+        default="localhost",
+        description="Database host",
+        env="DATABASE_HOST",
+    )
+
+    DATABASE_PORT: int = Field(
+        default="3306",
+        description="Database port",
+        env="DATABASE_PORT",
+    )
+
+    DATABASE_NAME: StrippedString = Field(
+        default="llm_router",
+        description="Database name",
+        env="DATABASE_NAME",
+    )
+    DATABASE_DRIVER: StrippedString = Field(
+        default="postgresql+psycopg",
+        description="Database name",
+        env="DATABASE_DRIVER",
+    )
 
     # Redis
-    REDIS_URL: str = "redis://localhost:6379/0"
+    REDIS_HOST: StrippedString = Field(
+        default="localhost",
+        description="Redis connection URL",
+        env="REDIS_HOST",
+    )
+    REDIS_PORT: int = Field(
+        default=6379,
+        description="Redis connection URL",
+        env="REDIS_PORT",
+    )
 
     # JWT / Auth
-    SECRET_KEY: str = "change-me-in-production-use-long-random-string"
-    JWT_ALGORITHM: str = "HS256"
-    JWT_EXPIRE_MINUTES: int = 60
-
-    # LDAP
-    LDAP_SERVER: str = "ldap://ldap.example.com"
-    LDAP_BASE_DN: str = "dc=example,dc=com"
-    LDAP_BIND_DN: str = "cn=service,dc=example,dc=com"
-    LDAP_BIND_PASSWORD: str = "service-password"
+    JWT_SECRET_KEY: StrippedString = Field(
+        default="change-me-in-production-use-long-random-string",
+        description="Secret key for JWT token generation",
+        env="JWT_SECRET_KEY",
+    )
+    JWT_ALGORITHM: StrippedString = Field(
+        default="HS256", description="JWT algorithm", env="JWT_ALGORITHM"
+    )
+    JWT_EXPIRE_MINUTES: int = Field(
+        default=60,
+        description="JWT token expiration time in minutes",
+        env="JWT_EXPIRE_MINUTES",
+    )
 
     # Super-user bootstrap
-    SUPERUSER_USERNAME: str = "admin"
-
+    SUPERUSER_USERNAME: StrippedString = Field(
+        default="admin", description="Superuser username", env="SUPERUSER_USERNAME"
+    )
+    ADMIN_INITIAL_PASSWORD: StrippedString = Field(
+        default="",
+        description="Initial password for default admin user (created on first startup if no users exist)",
+        env="ADMIN_INITIAL_PASSWORD",
+    )
     # Model config file path (relative to CWD or absolute)
-    MODELS_CONFIG_PATH: str = "config/models.yaml"
-
+    MODELS_CONFIG_PATH: StrippedString = Field(
+        default="/config/models.yaml",
+        description="Path to models configuration file",
+        env="MODELS_CONFIG_PATH",
+    )
     # Prometheus
-    PROMETHEUS_PORT: int = 9090
-
+    PROMETHEUS_PORT: int = Field(
+        default=9090, description="Prometheus metrics port", env="PROMETHEUS_PORT"
+    )
     # Fallback API key for backends whose api_key field is left empty
-    API_KEY: str = ""
+    API_KEY: str = Field(
+        default="EMPTY",
+        description="Fallback API key for model backends",
+        env="API_KEY",
+    )
 
-    # Identifies which cluster this router instance belongs to.
-    # Used as the default local_cluster_id for multi-cluster models when
-    # routing.local_cluster_id is not specified in models.yaml.
-    ROUTER_CLUSTER_ID: str = ""
+    VAULT_API_KEYs: dict = Field(
+        default={}, description="Fallback API key for model backends"
+    )
+
+    # Pheonix
+    PHEONIX_API_KEY: StrippedString = Field(
+        default="",
+        description="Fallback API key for model backends",
+        env="PHEONIX_API_KEY",
+    )
+    PHOENIX_TRACING_ENABLED: bool = Field(
+        default=False,
+        description="Enable Pheonix Tracing",
+        env="PHOENIX_TRACING_ENABLED",
+    )
+    PHOENIX_COLLECTOR_ENDPOINT: StrippedString = Field(
+        default="https://arize-phoenix.api.devdatasci.dc2.paycomhq.com",
+        description="Pheonix endpoint",
+        env="PHOENIX_COLLECTOR_ENDPOINT",
+    )
+
+    ALLOWED_GROUPS: List[str] = Field(
+        default=[],
+        description="Allowed LDAP groups",
+        env="ALLOWED_GROUPS",
+    )
+    ALLOWED_INDIVIUALS: List[str] = Field(
+        default=[],
+        description="Allowed LDAP Indivuals",
+        env="ALLOWED_INDIVIUALS",
+    )
+
+    # LDAP Service Account for user verification
+    LDAP_SERVICE_USERNAME: StrippedString = Field(
+        default="",
+        description="LDAP service account username for user verification",
+        env="LDAP_SERVICE_USERNAME",
+    )
+
+    DOCS_ENABLED: bool = Field(
+        default=False,
+        description="Enable Swagger UI (/docs) and ReDoc (/redoc) endpoints",
+        env="DOCS_ENABLED",
+    )
+    LDAP_SERVICE_PASSWORD: StrippedString = Field(
+        default="",
+        description="LDAP service account password for user verification",
+        env="LDAP_SERVICE_PASSWORD",
+    )
+
+    @field_validator("ALLOWED_GROUPS", "ALLOWED_INDIVIUALS", mode="before")
+    @classmethod
+    def split_allowed_groups(cls, v):
+        if v == "":
+            return []
+        if isinstance(v, str):
+            return [x.strip() for x in v.split(",")]
+        return v
+
+    CONCURRENT_TTL_SECONDS: int = Field(
+        default=300,
+        description="TTL (seconds) applied every time the counter is touched.",
+        env="CONCURRENT_TTL_SECONDS",
+    )
+
+    CONTENT_FILTER_REFRESH: int = Field(
+        default=60,
+        description="Refresh frequency in seconds for filters",
+        env="CONTENT_FILTER_REFRESH",
+    )
+
+    # TTL for cluster state keys (7 days)
+    # This ensures state persists across pod restarts but doesn't accumulate forever
+    CLUSTER_STATE_TTL_SECONDS: int = Field(
+        default=60,
+        description="TTL (seconds) for cluster state keys in Redis",
+        env="CLUSTER_STATE_TTL_SECONDS",
+    )
+
+    # Default TTL for metrics (24 hours) - metrics should be refreshed regularly
+    METRICS_TTL_SECONDS: int = Field(
+        default=300,
+        description="TTL (seconds) for metrics data in Redis",
+        env="METRICS_TTL_SECONDS",
+    )
+
+    # Vault Configuration
+    VAULT_ENABLED: bool = Field(
+        default=False,
+        description="Enable HashiCorp Vault integration",
+        env="VAULT_ENABLED",
+    )
+
+    # Vault paths
+    DATABASE_CREDS_PATH: str = Field(
+        default="",
+        description="Vault path to databse creds",
+        env="DATABASE_CREDS_PATH",
+    )
+    JWT_CREDS_PATH: str = Field(
+        default="",
+        description="Vault path to JWT settings",
+        env="JWT_CREDS_PATH",
+    )
+    API_KEY_PATH: str = Field(
+        default="application/datascience/llm-engines",
+        description="Vault path to API key",
+        env="API_KEY_PATH",
+    )
+    PHOENIX_KEY_VAULT_PATH: str = Field(
+        default="",
+        description="Vault path to API key",
+        env="PHOENIX_KEY_VAULT_PATH",
+    )
+
+    LDAP_SERVICE_USER_CRED_VAULT_PATH: str = Field(
+        default="",
+        description="Vault path to LDAP_SERVICE_USER",
+        env="LDAP_SERVICE_USER_CRED_VAULT_PATH",
+    )
+
+    ROUTER_CLUSTER_ID: str = Field(
+        default="",
+        description="Incluster ID",
+        env="ROUTER_CLUSTER_ID",
+    )
 
     # ------------------------------------------------------------------ #
     # Derived helpers
     # ------------------------------------------------------------------ #
-
-    def load_model_configs(self) -> List[Union[ModelConfig, MultiClusterModelConfig]]:
+    async def load_model_configs(
+        self,
+    ) -> List[Union[ModelConfig, MultiClusterModelConfig]]:
         """
         Parse MODELS_CONFIG_PATH and return one config object per model.
 
@@ -166,45 +373,81 @@ class Settings(BaseSettings):
             backend_type = entry.get("type", "static")
 
             if backend_type == "multi_cluster":
-                configs.append(self._parse_multi_cluster(entry))
+                cluster = await self._parse_multi_cluster(entry)
+                configs.append(cluster)
             else:
-                api_key = entry.get("api_key", "") or self.API_KEY
+                base_url = entry["base_url"]
+                try:
+                    api_key = await find_working_api_key(
+                        base_url=base_url, API_Keys=self.VAULT_API_KEYs
+                    )
+                except:
+                    logger.warning(f"Skipping {entry['model_id']} failed to connect.")
+                    continue
+                if api_key == "" :
+                    if self.API_KEY == "EMPTY":
+                        logger.warning(
+                            f"Skipping {entry['model_id']} since no API key in vault is applicable and default key is not set."
+                        )
+                        continue
+                    else:
+                        api_key = self.API_KEY
+                        
                 configs.append(
                     ModelConfig(
                         model_id=entry["model_id"],
-                        base_url=entry["base_url"],
+                        base_url=base_url,
                         api_key=api_key,
                     )
                 )
         return configs
 
-    def _parse_multi_cluster(self, entry: dict) -> MultiClusterModelConfig:
+    async def _parse_multi_cluster(self, entry: dict) -> MultiClusterModelConfig:
         """Parse a single multi_cluster model entry from models.yaml."""
         model_id: str = entry["model_id"]
-
+        local_cluster_id = "in-cluster"
         clusters: List[ClusterConfig] = []
         for c in entry.get("clusters", []):
+            base_url = c["base_url"]
+            try:
+                api_key = await find_working_api_key(
+                    base_url=base_url, API_Keys=self.VAULT_API_KEYs
+                )
+            except:
+                logger.warning(
+                    f"Skipping {model_id}:{c['cluster_id']} failed to connect."
+                )
+                continue
+            if api_key == "":
+                if self.API_KEY == "EMPTY":
+                    logger.warning(
+                        f"Skipping {model_id}:{c['cluster_id']} since no API key in vault is applicable and default key is not set."
+                    )
+                    continue
+                else:
+                    api_key = self.API_KEY
             clusters.append(
                 ClusterConfig(
                     cluster_id=c["cluster_id"],
                     base_url=c["base_url"].rstrip("/"),
-                    api_key=c.get("api_key", "") or self.API_KEY,
+                    api_key=api_key,
+                    number_of_replicas=int(c.get("number_of_replicas", 1)),
+                    is_enabled=bool(c.get("is_enabled", True)),
+                    auto_adapt_capacity=bool(c.get("auto_adapt_capacity", True)),
+                    priority=int(c.get("priority", 0)),
                 )
             )
 
         r = entry.get("routing", {})
-        local_cluster_id = (
-            r.get("local_cluster_id", "")
-            or self.ROUTER_CLUSTER_ID
-        )
+
         routing = RoutingConfig(
             local_cluster_id=local_cluster_id,
             spill_ratio=float(r.get("spill_ratio", 0.8)),
-            seed_capacity_tokens=int(r.get("seed_capacity_tokens", 200_000)),
+            seed_capacity_tokens_per_pod=int(r["seed_capacity_tokens_per_pod"]),
             default_max_tokens=int(r.get("default_max_tokens", 2048)),
             cache_ttl_seconds=int(r.get("cache_ttl_seconds", 3600)),
-            ttft_budget_ms=float(r.get("ttft_budget_ms", 500.0)),
-            itl_budget_ms=float(r.get("itl_budget_ms", 80.0)),
+            ttft_budget_ms=float(r.get("ttft_budget_ms", 800.0)),
+            itl_budget_ms=float(r.get("itl_budget_ms", 200.0)),
             ttft_alpha=float(r.get("ttft_alpha", 0.1)),
             itl_alpha=float(r.get("itl_alpha", 0.2)),
             capacity_alpha=float(r.get("capacity_alpha", 0.1)),
@@ -222,5 +465,76 @@ def get_settings() -> Settings:
     return Settings()
 
 
+def load_settings_from_vault() -> Settings:
+    """
+    Load settings with sensitive values from Vault.
+
+    This function creates a Settings instance and then overrides
+    sensitive values with those fetched from HashiCorp Vault.
+
+    Priority for sensitive settings:
+    1. Vault (if VAULT_ENABLED is true and configured)
+    2. Environment variables
+    3. Default values from Settings class
+
+    Returns:
+        Settings instance with values loaded from Vault where available
+    """
+    settings = get_settings()
+
+    # If Vault is not enabled, return settings as-is
+    if not settings.VAULT_ENABLED:
+        return settings
+
+    # Initialize Vault settings loader
+    vc = vault.get_client_using_os_environ()
+
+    try:
+        if not os.getenv("LOCAL_ENV_PATH", None):
+            settings.DATABASE_USER = vc.read_kv_secret(
+                "DATABASE_USER", settings.DATABASE_CREDS_PATH
+            ).get_secret_value()
+            settings.DATABASE_PASSWORD = vc.read_kv_secret(
+                "DATABASE_PASSWORD", settings.DATABASE_CREDS_PATH
+            ).get_secret_value()
+            settings.DATABASE_HOST = vc.read_kv_secret(
+                "DATABASE_HOST", settings.DATABASE_CREDS_PATH
+            ).get_secret_value()
+            settings.DATABASE_PORT = vc.read_kv_secret(
+                "DATABASE_PORT", settings.DATABASE_CREDS_PATH
+            ).get_secret_value()
+        settings.JWT_SECRET_KEY = vc.read_kv_secret(
+            "JWT_SECRET_KEY", settings.JWT_CREDS_PATH
+        ).get_secret_value()
+        settings.JWT_ALGORITHM = vc.read_kv_secret(
+            "JWT_ALGORITHM", settings.JWT_CREDS_PATH
+        ).get_secret_value()
+        settings.PHEONIX_API_KEY = vc.read_kv_secret(
+            "api_key", settings.PHOENIX_KEY_VAULT_PATH
+        ).get_secret_value()
+        settings.VAULT_API_KEYs = vc._read_full_kv_secret_path(settings.API_KEY_PATH)[
+            "data"
+        ]["data"]
+        settings.LDAP_SERVICE_USERNAME = vc.read_kv_secret(
+            "username",
+            settings.LDAP_SERVICE_USER_CRED_VAULT_PATH,
+        ).get_secret_value()
+        settings.LDAP_SERVICE_PASSWORD = vc.read_kv_secret(
+            "password",
+            settings.LDAP_SERVICE_USER_CRED_VAULT_PATH,
+        ).get_secret_value()
+
+    except Exception as e:
+        # Log the error but don't fail - fall back to environment variables
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            f"Failed to load settings from Vault: {e}. Using environment variables."
+        )
+
+    return settings
+
+
 # Convenience module-level alias
-settings = get_settings()
+settings = load_settings_from_vault()

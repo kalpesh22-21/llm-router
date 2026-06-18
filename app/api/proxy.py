@@ -1,15 +1,16 @@
 """
 Core proxy endpoints.
 
-POST /v1/chat/completions  — main LLM proxy (streaming and non-streaming)
-POST /v1/embeddings        — embeddings proxy
+POST /v1/chat/completions  — main LLM proxy (OpenAI-compatible, streaming and non-streaming)
+POST /v1/embeddings        — embeddings proxy (OpenAI-compatible)
 GET  /v1/models            — list models accessible to the current user
+POST /v1/messages          — Anthropic-compatible messages endpoint (streaming and non-streaming)
 
 Every request:
   1. Validates JWT
-  2. Checks is_active against DB (not just JWT claim)
-  3. Validates the requested model is in the user's accessible models
-  4. Checks + increments concurrent request counter in Redis
+  2. Checks is_active against DB randomly (~1% of requests)
+  3. Validates the requested model is in the user's accessible models (from JWT)
+  4. Checks + increments concurrent request counter in Redis (limit from JWT)
   5. Forwards to the appropriate backend
   6. Collects metrics
   7. Decrements concurrent counter (finally block)
@@ -19,25 +20,31 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
-from typing import Annotated, AsyncIterator, Optional
+from typing import Annotated, AsyncIterator, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-
 import redis.asyncio as aioredis
 
-from app.api.auth_routes import get_current_user_payload
-from app.backends.base import registry as backend_registry
-from app.backends.static import StaticBackend
-from app.db.mysql import User, get_db
-from app.db.redis_client import get_redis
+from app.api.auth_routes import get_current_user_payload, get_current_user_payload_from_request
+from app.backends.base import Backend
+from app.db.mysql import get_db
+from app.db.redis_client import (
+    get_redis,
+    is_user_marked_deactivated,
+    mark_user_deactivated,
+    unmark_user_deactivated,
+)
 from app.metrics.collector import metrics_collector
 from app.routing.router import model_router
+from app.services.content_filter import content_filter_service
 from app.services.permission import permission_service
 from app.services.rate_limit import rate_limit_service
+from app.logging.pheonix import SpanKind, TracingHelper
 
 logger = logging.getLogger(__name__)
 
@@ -51,58 +58,114 @@ router = APIRouter(prefix="/v1", tags=["proxy"])
 async def _resolve_user(
     payload: dict,
     db: AsyncSession,
-) -> tuple[int, int]:
+    redis: aioredis.Redis,
+) -> tuple[str, int, int]:
     """
-    Extract user_id from JWT payload and verify the user is still active in DB.
+    Extract user info from JWT payload.
+
+    Checks DB for is_active status:
+    - Always if user is in the deactivated tracking set (was previously deactivated)
+    - Randomly (~10% of requests) for other users to catch newly deactivated users
+
+    If a deactivated user is found, they are added to the tracking set.
+    If a tracked user is found active again, they are removed from tracking.
 
     Returns:
-        (user_id, max_concurrent_requests)
+        (username, user_id, max_concurrent_requests)
 
     Raises:
         HTTPException(401) if the user is inactive or not found.
     """
     user_id = int(payload["sub"])
+    username = payload["username"]
+    max_concurrent = payload.get("max_concurrent_requests", 10)
 
-    # Always check DB — a deactivated user may still hold a valid JWT
-    is_active = await permission_service.is_user_active(db, user_id)
-    if not is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Account is deactivated",
-        )
+    # Check if user is in the deactivated tracking set
+    is_tracked_deactivated = await is_user_marked_deactivated(redis, user_id)
 
-    user = await permission_service.get_user(db, user_id)
-    return user_id, user.max_concurrent_requests
+    # Always check DB if user was previously deactivated, otherwise random 10% check
+    should_check_db = is_tracked_deactivated or (random.random() < 0.01)
+
+    if should_check_db:
+        is_active = await permission_service.is_user_active(db, user_id)
+        if not is_active:
+            # Mark user as deactivated in tracking set
+            await mark_user_deactivated(redis, user_id, username)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Account is deactivated",
+            )
+        # User is active - if they were in tracking, remove them
+        if is_tracked_deactivated:
+            await unmark_user_deactivated(redis, user_id)
+            logger.info(
+                "User %s (id=%d) reactivated, removed from deactivated tracking",
+                username,
+                user_id,
+            )
+
+    return username, user_id, max_concurrent
 
 
 def _extract_usage(data: dict) -> tuple[int, int]:
     """Extract (prompt_tokens, completion_tokens) from a response body dict."""
-    usage = data.get("usage") or {}
     return (
-        int(usage.get("prompt_tokens", 0)),
-        int(usage.get("completion_tokens", 0)),
+        int(data.get("prompt_tokens", 0)),
+        int(data.get("completion_tokens", 0)),
     )
 
 
-def _parse_sse_data(chunk: bytes) -> Optional[dict]:
+def _extract_error_body(response: httpx.Response) -> dict:
+    """
+    Extract error body from a backend error response.
+
+    Tries to parse JSON first, falls back to text content if JSON parsing fails.
+    Returns an empty dict if neither can be extracted.
+    """
+    try:
+        return response.json()
+    except Exception:
+        pass
+
+    try:
+        text_content = response.text
+        if text_content:
+            return {"detail": text_content}
+    except Exception:
+        pass
+
+    return {}
+
+
+def _are_all_choices_finished(payload: dict) -> bool:
+    choices = payload.get("choices", [])
+    return all([choice.get("finish_reason") for choice in choices])
+
+
+def _parse_sse_data(chunk: bytes) -> Tuple[bool, Optional[dict]]:
     """
     Parse a single SSE chunk and return the JSON payload if present.
 
     SSE format: ``data: <json>\\n\\n``
-    Returns None for ``data: [DONE]`` or non-data lines.
     """
+    is_last = False
     text = chunk.decode("utf-8", errors="replace").strip()
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("data:"):
-            payload = line[len("data:"):].strip()
-            if payload == "[DONE]":
-                return None
+            data_str = line[len("data:") :].strip()
+            # Check for [DONE] BEFORE trying to parse as JSON
+            if data_str == "[DONE]":
+                return True, None
             try:
-                return json.loads(payload)
+                payload = json.loads(data_str)
+                if _are_all_choices_finished(payload):
+                    is_last = True
+                return is_last, payload
             except json.JSONDecodeError:
-                pass
-    return None
+                logging.warning("Failed SSE Decoding for: %s", data_str[:100])
+                continue
+    return is_last, None
 
 
 # ---------------------------------------------------------------------------
@@ -111,18 +174,22 @@ def _parse_sse_data(chunk: bytes) -> Optional[dict]:
 
 
 async def _stream_response(
-    backend: StaticBackend,
+    backend: Backend,
     request: Request,
+    upstream_url: str,
     body: dict,
     model_id: str,
     user_id: int,
+    username: str,
     start_time: float,
     redis: aioredis.Redis,
+    request_landing_time: float,
 ) -> AsyncIterator[bytes]:
     """
     Stream SSE chunks from the backend to the client.
 
     While streaming, captures:
+      - Router internal latency (from request landing to stream start)
       - Time-to-first-token (TTFT)
       - Inter-token latencies (ITL) between consecutive token-bearing chunks
       - Token usage from the final chunk (if include_usage: true was set)
@@ -131,22 +198,25 @@ async def _stream_response(
     regardless of success or failure.
     """
     # Ensure the backend includes usage in the last chunk
-    body.setdefault("stream_options", {})["include_usage"] = True
-
+    body.setdefault("stream_options", {})["continuous_usage_stats"] = True
     first_token = True
     ttft: float = 0.0
-    prev_token_time: float = start_time
+    token_counter: int = 0
+    last_usage_data: Optional[dict] = None
     inter_token_latencies: list[float] = []
-    last_data: Optional[dict] = None
     http_status = "200"
-
+    metrics_collector.record_router_latency_to_stream(
+        model_id=model_id,
+        latency=time.monotonic() - request_landing_time,
+    )
     try:
-        async for chunk in backend.forward_stream(request, body):
+        async for chunk in backend.forward_stream(
+            request, body, upstream_url=upstream_url
+        ):
             now = time.monotonic()
-
-            parsed = _parse_sse_data(chunk)
-            if parsed is not None:
-                # Track timing
+            is_last, parsed = _parse_sse_data(chunk)
+            # Track timing for actual content chunks
+            if parsed:
                 if first_token:
                     ttft = now - start_time
                     first_token = False
@@ -156,33 +226,59 @@ async def _stream_response(
                     inter_token_latencies.append(itl)
                     prev_token_time = now
 
-                # Keep the last non-DONE data chunk (contains usage)
-                last_data = parsed
-
-            yield chunk
+                if is_last:
+                    last_usage_data = parsed.get("usage", None)
+                else:
+                    parsed.pop("usage", None)
+                token_counter += 1
+                yield f"data: {json.dumps(parsed)}\n\n".encode()
+            else:
+                yield f"data: [DONE]"
 
     except httpx.HTTPStatusError as exc:
         http_status = str(exc.response.status_code)
         logger.error("Backend streaming error for model=%s: %s", model_id, exc)
         # Yield an error SSE event so the client sees something
-        error_payload = json.dumps({"error": {"message": str(exc), "type": "backend_error"}})
+        error_payload = json.dumps(
+            {"error": {"message": str(exc), "type": "backend_error"}}
+        )
         yield f"data: {error_payload}\n\n".encode()
     except Exception:
         http_status = "500"
         logger.exception("Unexpected streaming error for model=%s", model_id)
-        error_payload = json.dumps({"error": {"message": "Internal proxy error", "type": "proxy_error"}})
+        error_payload = json.dumps(
+            {"error": {"message": "Internal proxy error", "type": "proxy_error"}}
+        )
         yield f"data: {error_payload}\n\n".encode()
     finally:
+        # Always decrement the concurrent request counter
+        try:
+            await rate_limit_service.decrement(redis, user_id)
+            metrics_collector.record_concurrent_decrement(
+                model_id=model_id, username=username
+            )
+        except Exception:
+            logger.exception(
+                "Failed to decrement concurrent counter for user=%s", username
+            )
         duration = time.monotonic() - start_time
 
         # Extract token counts from the final usage chunk
         input_tokens, output_tokens = 0, 0
-        if last_data:
-            input_tokens, output_tokens = _extract_usage(last_data)
+        if last_usage_data is not None:
+            try:
+                input_tokens, output_tokens = _extract_usage(last_usage_data)
+            except Exception:
+                logger.warning("Failed to extract usage from final chunk")
+        else:
+            logger.debug("Last chunk was empty.")
+        # Fallback: if backend doesn't send usage chunk, use token counter for output
+        if output_tokens == 0:
+            output_tokens = token_counter
 
         metrics_collector.record_request_complete(
             model_id=model_id,
-            user_id=str(user_id),
+            username=username,
             status=http_status,
             duration=duration,
             input_tokens=input_tokens,
@@ -195,14 +291,6 @@ async def _stream_response(
                 inter_token_latencies=inter_token_latencies,
             )
 
-        # Always decrement the concurrent request counter
-        try:
-            await rate_limit_service.decrement(redis, user_id)
-        except Exception:
-            logger.exception(
-                "Failed to decrement concurrent counter for user_id=%d", user_id
-            )
-
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -210,6 +298,9 @@ async def _stream_response(
 
 
 @router.post("/chat/completions", response_model=None)
+@TracingHelper.trace_async(
+    span_kind=SpanKind.LLM, sensitive_keys=["payload", "db", "redis"]
+)
 async def chat_completions(
     request: Request,
     payload: Annotated[dict, Depends(get_current_user_payload)],
@@ -221,6 +312,10 @@ async def chat_completions(
 
     Handles both streaming (stream=true) and non-streaming requests.
     """
+    # Capture request landing time at the very beginning
+    # This measures from request received to when processing starts
+    request_landing_time = time.monotonic()
+
     # Parse request body
     try:
         body: dict = await request.json()
@@ -238,11 +333,29 @@ async def chat_completions(
         )
 
     # Resolve and verify user
-    user_id, max_concurrent = await _resolve_user(payload, db)
+    username, user_id, max_concurrent = await _resolve_user(payload, db, redis)
+    logger.debug(f"Took {time.monotonic() - request_landing_time} for resolving user")
+    # Content filter check
+    filter_result = await content_filter_service.check_request_body(body)
+    logger.debug(f"Took {time.monotonic() - request_landing_time} for filtering user")
+    if filter_result:
+        # Content violation detected
+        logger.warning(
+            "Content filter violation detected for user=%s: rule=%s, matched=%s",
+            username,
+            filter_result.rule_name,
+            filter_result.matched_text,
+        )
+        if filter_result.is_blocking:
+            error_message = filter_result.message or "Content violates filter rules"
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Content filter blocked: {error_message}",
+            )
 
-    # Check model access
-    accessible = await permission_service.get_user_accessible_models(db, user_id)
-    if model_id not in accessible:
+    # Check model access from JWT claims (no DB call)
+    accessible_models = set(payload.get("accessible_models", []))
+    if model_id not in accessible_models:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Model {model_id!r} is not accessible to this user",
@@ -250,25 +363,28 @@ async def chat_completions(
 
     # Rate limit: check-and-increment (raises 429 if exceeded)
     await rate_limit_service.assert_within_limit(redis, user_id, max_concurrent)
+    metrics_collector.record_concurrent_increment(model_id=model_id, username=username)
 
+    logger.debug(f"Took {time.monotonic() - request_landing_time} for redis")
     start_time = time.monotonic()
     is_streaming: bool = bool(body.get("stream", False))
 
     try:
         backend = model_router.resolve(model_id)
-
         if is_streaming:
-            stream_gen = _stream_response(
-                backend=backend,  # type: ignore[arg-type]
-                request=request,
-                body=body,
-                model_id=model_id,
-                user_id=user_id,
-                start_time=start_time,
-                redis=redis,
-            )
             return StreamingResponse(
-                stream_gen,
+                _stream_response(
+                    backend=backend,  # type: ignore[arg-type]
+                    request=request,
+                    upstream_url="/chat/completions",
+                    body=body,
+                    model_id=model_id,
+                    user_id=user_id,
+                    username=username,
+                    start_time=start_time,
+                    redis=redis,
+                    request_landing_time=request_landing_time,
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -277,7 +393,9 @@ async def chat_completions(
             )
 
         # ---- Non-streaming path ----
-        response = await backend.forward(request, body)
+        response = await backend.forward(
+            request, body, upstream_url="/chat/completions"
+        )
         duration = time.monotonic() - start_time
 
         http_status = str(response.status_code)
@@ -290,15 +408,12 @@ async def chat_completions(
             except Exception:
                 resp_body = {}
         else:
-            resp_body = {}
-            try:
-                resp_body = response.json()
-            except Exception:
-                pass
+            # Propagate backend error response to client
+            resp_body = _extract_error_body(response)
 
         metrics_collector.record_request_complete(
             model_id=model_id,
-            user_id=str(user_id),
+            username=str(username),
             status=http_status,
             duration=duration,
             input_tokens=input_tokens,
@@ -314,10 +429,12 @@ async def chat_completions(
         raise
     except Exception:
         duration = time.monotonic() - start_time
-        logger.exception("Unhandled proxy error for model=%s user=%d", model_id, user_id)
+        logger.exception(
+            "Unhandled proxy error for model=%s user=%s", model_id, username
+        )
         metrics_collector.record_request_complete(
             model_id=model_id,
-            user_id=str(user_id),
+            username=str(username),
             status="500",
             duration=duration,
             input_tokens=0,
@@ -331,9 +448,15 @@ async def chat_completions(
         # Always decrement for non-streaming; streaming decrements inside generator
         if not is_streaming:
             await rate_limit_service.decrement(redis, user_id)
+            metrics_collector.record_concurrent_decrement(
+                model_id=model_id, username=username
+            )
 
 
 @router.post("/embeddings")
+@TracingHelper.trace_async(
+    span_kind=SpanKind.EMBEDDING, sensitive_keys=["payload", "db", "redis"]
+)
 async def embeddings(
     request: Request,
     payload: Annotated[dict, Depends(get_current_user_payload)],
@@ -360,16 +483,18 @@ async def embeddings(
             detail="'model' field is required",
         )
 
-    user_id, max_concurrent = await _resolve_user(payload, db)
+    username, user_id, max_concurrent = await _resolve_user(payload, db, redis)
 
-    accessible = await permission_service.get_user_accessible_models(db, user_id)
-    if model_id not in accessible:
+    # Check model access from JWT claims (no DB call)
+    accessible_models = set(payload.get("accessible_models", []))
+    if model_id not in accessible_models:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Model {model_id!r} is not accessible to this user",
         )
 
     await rate_limit_service.assert_within_limit(redis, user_id, max_concurrent)
+    metrics_collector.record_concurrent_increment(model_id=model_id, username=username)
 
     start_time = time.monotonic()
 
@@ -385,15 +510,11 @@ async def embeddings(
         duration = time.monotonic() - start_time
         http_status = str(response.status_code)
 
-        resp_body: dict = {}
-        try:
-            resp_body = response.json()
-        except Exception:
-            pass
+        resp_body = _extract_error_body(response)
 
         metrics_collector.record_request_complete(
             model_id=model_id,
-            user_id=str(user_id),
+            username=str(username),
             status=http_status,
             duration=duration,
             input_tokens=0,
@@ -409,7 +530,7 @@ async def embeddings(
         logger.exception("Embeddings proxy error for model=%s", model_id)
         metrics_collector.record_request_complete(
             model_id=model_id,
-            user_id=str(user_id),
+            username=str(username),
             status="500",
             duration=duration,
             input_tokens=0,
@@ -421,34 +542,196 @@ async def embeddings(
         )
     finally:
         await rate_limit_service.decrement(redis, user_id)
+        metrics_collector.record_concurrent_decrement(
+            model_id=model_id, username=username
+        )
 
 
 @router.get("/models")
 async def list_models(
     payload: Annotated[dict, Depends(get_current_user_payload)],
     db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
 ) -> JSONResponse:
     """
     Return the list of models accessible to the current user.
 
     Response format matches the OpenAI /v1/models shape.
+    Uses JWT claims for model list (no DB call for models).
     """
-    user_id = int(payload["sub"])
+    await _resolve_user(payload, db, redis)
 
-    is_active = await permission_service.is_user_active(db, user_id)
-    if not is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Account is deactivated",
-        )
-
-    model_ids = await permission_service.get_user_accessible_models(db, user_id)
-
-    # Return only models that have a registered backend
-    available = [mid for mid in model_ids if backend_registry.get(mid) is not None]
+    # Get models from JWT claims (no DB call)
+    model_ids = payload.get("accessible_models", [])
 
     data = [
         {"id": mid, "object": "model", "owned_by": "llm-router"}
-        for mid in sorted(available)
+        for mid in sorted(model_ids)
     ]
-    return JSONResponse(content={"object": "list", "data": data})
+
+    # Get the default model from the default bucket
+    default_model = await permission_service.get_default_model(db)
+
+    return JSONResponse(content={"object": "list", "data": data, "default_model": default_model})
+
+
+# ---------------------------------------------------------------------------
+# Anthropic /v1/messages endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.post("/messages", response_model=None)
+@TracingHelper.trace_async(
+    span_kind=SpanKind.LLM, sensitive_keys=["payload", "db", "redis"]
+)
+async def messages(
+    request: Request,
+    payload: Annotated[dict, Depends(get_current_user_payload_from_request)],
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+) -> StreamingResponse | JSONResponse:
+    """
+    Anthropic-compatible /v1/messages endpoint.
+
+    Forwards Anthropic-format requests to the backend /v1/messages endpoint.
+    Supports both streaming (stream=true) and non-streaming requests.
+    """
+    # Capture request landing time at the very beginning
+    request_landing_time = time.monotonic()
+
+    # Parse request body
+    try:
+        body: dict = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON body",
+        )
+
+    model_id: str = body.get("model", "")
+    if not model_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="'model' field is required",
+        )
+
+    # Resolve and verify user
+    username, user_id, max_concurrent = await _resolve_user(payload, db, redis)
+    logger.debug(f"Took {time.monotonic() - request_landing_time} for resolving user")
+
+    # Content filter check
+    filter_result = await content_filter_service.check_request_body(body)
+    logger.debug(f"Took {time.monotonic() - request_landing_time} for filtering user")
+    if filter_result:
+        logger.warning(
+            "Content filter violation detected for user=%s: rule=%s, matched=%s",
+            username,
+            filter_result.rule_name,
+            filter_result.matched_text,
+        )
+        if filter_result.is_blocking:
+            error_message = filter_result.message or "Content violates filter rules"
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Content filter blocked: {error_message}",
+            )
+
+    # Check model access from JWT claims (no DB call)
+    accessible_models = set(payload.get("accessible_models", []))
+    if model_id not in accessible_models:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Model {model_id!r} is not accessible to this user",
+        )
+
+    # Rate limit: check-and-increment (raises 429 if exceeded)
+    await rate_limit_service.assert_within_limit(redis, user_id, max_concurrent)
+    metrics_collector.record_concurrent_increment(model_id=model_id, username=username)
+
+    logger.debug(f"Took {time.monotonic() - request_landing_time} for redis")
+    start_time = time.monotonic()
+    is_streaming: bool = bool(body.get("stream", False))
+
+    try:
+        backend = model_router.resolve(model_id)
+        if is_streaming:
+            return StreamingResponse(
+                _stream_response(
+                    backend=backend,  # type: ignore[arg-type]
+                    request=request,
+                    upstream_url="/messages",
+                    body=body,
+                    model_id=model_id,
+                    user_id=user_id,
+                    username=username,
+                    start_time=start_time,
+                    redis=redis,
+                    request_landing_time=request_landing_time,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        # ---- Non-streaming path ----
+        response = await backend.forward(request, body, upstream_url="/messages")
+        duration = time.monotonic() - start_time
+
+        http_status = str(response.status_code)
+        input_tokens, output_tokens = 0, 0
+
+        if response.status_code == 200:
+            try:
+                resp_body = response.json()
+                # Anthropic format uses input_tokens/output_tokens
+                usage = resp_body.get("usage", {})
+                input_tokens = usage.get("input_tokens", 0)
+                output_tokens = usage.get("output_tokens", 0)
+            except Exception:
+                resp_body = _extract_error_body(response)
+        else:
+            # Propagate backend error response to client
+            resp_body = _extract_error_body(response)
+
+        metrics_collector.record_request_complete(
+            model_id=model_id,
+            username=str(username),
+            status=http_status,
+            duration=duration,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+        return JSONResponse(
+            content=resp_body,
+            status_code=response.status_code,
+        )
+
+    except HTTPException:
+        raise
+    except Exception:
+        duration = time.monotonic() - start_time
+        logger.exception(
+            "Unhandled proxy error for model=%s user=%s", model_id, username
+        )
+        metrics_collector.record_request_complete(
+            model_id=model_id,
+            username=str(username),
+            status="500",
+            duration=duration,
+            input_tokens=0,
+            output_tokens=0,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Backend error",
+        )
+    finally:
+        # Always decrement for non-streaming; streaming decrements inside generator
+        if not is_streaming:
+            await rate_limit_service.decrement(redis, user_id)
+            metrics_collector.record_concurrent_decrement(
+                model_id=model_id, username=username
+            )
