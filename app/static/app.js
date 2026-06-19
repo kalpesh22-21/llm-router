@@ -389,6 +389,9 @@ function openModal(title, bodyHTML, onSubmit, submitLabel = 'Save') {
   document.getElementById('modal-body').innerHTML = bodyHTML
   document.getElementById('modal-overlay').classList.remove('hidden')
   const btn = document.getElementById('modal-submit')
+  btn.style.display = ''
+  const cancelBtn = btn.previousElementSibling
+  if (cancelBtn) { cancelBtn.style.display = ''; cancelBtn.textContent = 'Cancel' }
   btn.textContent = submitLabel
   btn.onclick = async () => {
     btn.disabled = true

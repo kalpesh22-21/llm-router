@@ -330,6 +330,83 @@ class Settings(BaseSettings):
         env="DISCOVERY_FAILURE_THRESHOLD",
     )
 
+    # Discovery source mode: where backends come from.
+    #   config     — static models.yaml only (default, backward compatible)
+    #   kubernetes — scan K8s namespaces for labelled Services
+    #   both       — static models.yaml AND discovered K8s services
+    DISCOVERY_MODE: StrippedString = Field(
+        default="config",
+        description="Backend discovery source: config | kubernetes | both.",
+        env="DISCOVERY_MODE",
+    )
+
+    # --- Kubernetes service discovery (DISCOVERY_MODE in {kubernetes, both}) --- #
+    DISCOVERY_K8S_NAMESPACES: StrippedString = Field(
+        default="default",
+        description="Comma-separated list of namespaces to scan for model Services.",
+        env="DISCOVERY_K8S_NAMESPACES",
+    )
+    DISCOVERY_K8S_LABEL_SELECTOR: StrippedString = Field(
+        default="llm-router/enabled=true",
+        description="Label selector identifying Services to register as backends.",
+        env="DISCOVERY_K8S_LABEL_SELECTOR",
+    )
+    DISCOVERY_K8S_MODEL_ID_LABEL: StrippedString = Field(
+        default="llm-router/model-id",
+        description="Service label whose value is the model_id.",
+        env="DISCOVERY_K8S_MODEL_ID_LABEL",
+    )
+    DISCOVERY_K8S_PORT_LABEL: StrippedString = Field(
+        default="llm-router/port",
+        description="Optional per-Service label overriding DISCOVERY_DEFAULT_PORT.",
+        env="DISCOVERY_K8S_PORT_LABEL",
+    )
+    DISCOVERY_K8S_SCHEME_LABEL: StrippedString = Field(
+        default="llm-router/scheme",
+        description="Optional per-Service label overriding DISCOVERY_SCHEME.",
+        env="DISCOVERY_K8S_SCHEME_LABEL",
+    )
+    DISCOVERY_K8S_PATH_LABEL: StrippedString = Field(
+        default="llm-router/path",
+        description="Optional per-Service label overriding DISCOVERY_PATH.",
+        env="DISCOVERY_K8S_PATH_LABEL",
+    )
+    DISCOVERY_DEFAULT_PORT: int = Field(
+        default=8000,
+        description="Default port for a discovered Service's endpoint.",
+        env="DISCOVERY_DEFAULT_PORT",
+    )
+    DISCOVERY_SCHEME: StrippedString = Field(
+        default="http",
+        description="Default scheme for a discovered Service's endpoint.",
+        env="DISCOVERY_SCHEME",
+    )
+    DISCOVERY_PATH: StrippedString = Field(
+        default="/v1",
+        description="Default path suffix for a discovered Service's endpoint.",
+        env="DISCOVERY_PATH",
+    )
+    DISCOVERY_K8S_CLUSTER_DOMAIN: StrippedString = Field(
+        default="svc.cluster.local",
+        description="Cluster DNS domain; URL = <scheme>://<svc>.<ns>.<domain>:<port><path>.",
+        env="DISCOVERY_K8S_CLUSTER_DOMAIN",
+    )
+    DISCOVERY_K8S_RESYNC_SECONDS: int = Field(
+        default=30,
+        description="Seconds between Kubernetes Service re-list/reconcile passes.",
+        env="DISCOVERY_K8S_RESYNC_SECONDS",
+    )
+    DISCOVERY_K8S_KUBECONFIG: StrippedString = Field(
+        default="",
+        description="Path to a kubeconfig (dev); empty uses in-cluster ServiceAccount.",
+        env="DISCOVERY_K8S_KUBECONFIG",
+    )
+    DISCOVERY_K8S_FAKE_SERVICES_FILE: StrippedString = Field(
+        default="",
+        description="Test/E2E only: JSON file of fake Services to list instead of K8s.",
+        env="DISCOVERY_K8S_FAKE_SERVICES_FILE",
+    )
+
     CONTENT_FILTER_REFRESH: int = Field(
         default=60,
         description="Refresh frequency in seconds for filters",

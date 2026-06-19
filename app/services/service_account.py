@@ -83,6 +83,10 @@ class ServiceAccountService:
                     db, service_id=account.id, bucket_id=bucket_id, by_user_id=by_user_id
                 )
 
+        # Refresh so that server-default columns (created_at, updated_at) are
+        # loaded before the caller serializes the object.  get_db() owns the
+        # commit; we only need the attributes populated within this transaction.
+        await db.refresh(account)
         logger.info(
             "Service account %r (id=%d) created by user_id=%d",
             name,
@@ -140,6 +144,10 @@ class ServiceAccountService:
         account = await self.get_service_account(db, service_id)
         account.is_active = is_active
         await db.flush()
+        # Refresh so that server-default columns (created_at, updated_at) are
+        # loaded before the caller serializes the object.  get_db() owns the
+        # commit; we only need the attributes populated within this transaction.
+        await db.refresh(account)
         logger.info(
             "Service account %r (id=%d) set is_active=%s by user_id=%d",
             account.name,

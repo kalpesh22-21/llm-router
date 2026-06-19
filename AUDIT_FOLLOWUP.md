@@ -71,6 +71,33 @@ UP → `available:true`, gauge `1.0`, listed, chat `200` · DOWN (mock stopped) 
 restarted) → `available:true`, gauge `1.0`, chat `200`. Unit tests: `10 passed`.
 Teardown: `docker compose -f docker-compose.e2e.yml down -v`.
 
+## ✨ Kubernetes service discovery (second discovery mode, added 2026-06)
+
+A second discovery **source**: `DISCOVERY_MODE` = `config` | `kubernetes` | `both`.
+In `kubernetes`/`both`, `KubernetesServiceDiscovery` periodically lists Services
+in `DISCOVERY_K8S_NAMESPACES` matching `DISCOVERY_K8S_LABEL_SELECTOR` and
+registers one `StaticBackend` per service; the existing health-probe loop then
+probes them. Decisions: model_id from a label (`DISCOVERY_K8S_MODEL_ID_LABEL`) ·
+poll+reconcile every `DISCOVERY_K8S_RESYNC_SECONDS` · URL =
+`<scheme>://<svc>.<ns>.<cluster_domain>:<port><path>` from config defaults +
+per-service label overrides · `both` mode never reaps/overwrites config models
+(reconciler only touches model_ids it owns).
+
+Pieces:
+- [app/services/kubernetes_discovery.py](app/services/kubernetes_discovery.py) — `KubernetesServiceDiscovery` + pluggable `ServiceLister` (`K8sServiceLister` real, `FakeServiceLister` for tests/E2E). `kubernetes_asyncio` import is **guarded** (app boots in config mode without it).
+- [app/backends/base.py](app/backends/base.py) — registry `upsert()` / `unregister()` / `contains()`.
+- [app/core/config.py](app/core/config.py) — `DISCOVERY_MODE` + `DISCOVERY_K8S_*` settings.
+- [app/main.py](app/main.py) — mode-aware lifespan wiring + shutdown.
+- [tests/test_kubernetes_discovery.py](tests/test_kubernetes_discovery.py) — mapping + reconcile (add/remove/skip-config/update).
+- E2E: `docker/e2e_k8s_test.sh` + `docker/k8s_fake_services.json` (fake lister; mock-upstream gets a `*.svc.cluster.local` network alias so the discovered DNS resolves).
+
+**E2E result (passed, mode=both, no real cluster):** static `test-model` + discovered
+`k8s-discovered-model` coexist → both chat `200`; remove the Service live → discovered
+model unregisters (chat `404`) while `test-model` is untouched (`200`); re-add → back
+(`200`). `kubernetes_asyncio importable=False` (guard verified). Unit: `17 passed`.
+For a real cluster: `pip install kubernetes-asyncio`, set `DISCOVERY_MODE=kubernetes`,
+unset `DISCOVERY_K8S_FAKE_SERVICES_FILE`, grant the pod RBAC to `list` Services.
+
 ## ✅ Done (static / Phase-1)
 
 - [x] **JWT fail-closed** — refuse to boot if `VAULT_ENABLED` but `JWT_SECRET_KEY` is the placeholder/empty — [app/core/config.py](app/core/config.py)

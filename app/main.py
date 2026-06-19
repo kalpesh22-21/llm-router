@@ -57,6 +57,7 @@ from app.core.httpx import close_http_client
 from app.services.cross_pod_sync_service import cross_pod_sync_service
 from app.services.discovery_service import discovery_service
 from app.services.drain_monitor import drain_monitor
+from app.services.kubernetes_discovery import kubernetes_discovery
 from sqlalchemy import select
 
 
@@ -176,13 +177,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:
         logger.warning("Default admin user creation failed (non-critical): %s", exc)
 
-    # 3. Load model configs and build backend registry
-    try:
-        await build_registry_from_config()
-        logger.info("Backend registry initialised")
-    except Exception as exc:
-        logger.error("Failed to build backend registry: %s", exc)
-        raise
+    # 3. Build the backend registry from the configured discovery source(s).
+    #    DISCOVERY_MODE: config | kubernetes | both.
+    discovery_mode = get_settings().DISCOVERY_MODE.lower()
+
+    if discovery_mode in ("config", "both"):
+        try:
+            await build_registry_from_config()
+            logger.info("Backend registry initialised from config (mode=%s)", discovery_mode)
+        except Exception as exc:
+            logger.error("Failed to build backend registry: %s", exc)
+            raise
+
+    if discovery_mode in ("kubernetes", "both"):
+        # Non-critical: if K8s is briefly unreachable the app still starts and
+        # the discovery loop keeps retrying.
+        try:
+            await kubernetes_discovery.start()
+            logger.info("Kubernetes service discovery started (mode=%s)", discovery_mode)
+        except Exception as exc:
+            logger.error("Kubernetes service discovery failed to start: %s", exc)
 
     # 3.5. Start the discovery service: run an initial probe of static backends
     # (so availability is correct before serving) and keep it in sync in the
@@ -261,6 +275,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("Discovery service stopped")
     except Exception as exc:
         logger.warning("Error stopping discovery service: %s", exc)
+
+    try:
+        await kubernetes_discovery.stop()
+        logger.info("Kubernetes service discovery stopped")
+    except Exception as exc:
+        logger.warning("Error stopping Kubernetes service discovery: %s", exc)
 
     await close_redis()
     await close_http_client()

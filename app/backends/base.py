@@ -103,6 +103,25 @@ class BackendRegistry:
             return
         self._backends[backend.model_id] = backend
 
+    def upsert(self, backend: Backend) -> None:
+        """
+        Register or replace the backend for a model_id.
+
+        Unlike register(), this overwrites an existing entry — used by dynamic
+        discovery (e.g. KubernetesServiceDiscovery) when a service's endpoint
+        changes. dict assignment is atomic, so concurrent resolve() reads always
+        see either the old or the new backend, never a partial state.
+        """
+        self._backends[backend.model_id] = backend
+
+    def unregister(self, model_id: str) -> Optional[Backend]:
+        """Remove and return the backend for *model_id* (None if absent)."""
+        return self._backends.pop(model_id, None)
+
+    def contains(self, model_id: str) -> bool:
+        """Whether a backend is registered for *model_id*."""
+        return model_id in self._backends
+
     def get(self, model_id: str) -> Optional[Backend]:
         """
         Return the Backend for *model_id*, or None if not registered.

@@ -165,6 +165,10 @@ class ApiKeyService:
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Key hash collision — please retry (extremely rare).",
             )
+        # Refresh so that server-default columns (created_at) are loaded before
+        # the caller reads them.  get_db() owns the commit; we only need the
+        # attributes populated within this transaction.
+        await db.refresh(row)
         logger.info(
             "API key %r (id=%d) created for service_id=%d by user_id=%d",
             name,

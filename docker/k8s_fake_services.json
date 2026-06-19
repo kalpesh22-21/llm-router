@@ -1,0 +1,1 @@
+[{"name":"mock-upstream","namespace":"default","labels":{"llm-router/enabled":"true","llm-router/model-id":"k8s-discovered-model","llm-router/port":"9000"}}]

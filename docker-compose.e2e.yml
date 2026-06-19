@@ -50,7 +50,13 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
-    networks: [e2e]
+    networks:
+      e2e:
+        # Make the K8s-style DNS name a discovered Service maps to resolve here,
+        # so a discovered base_url http://mock-upstream.default.svc.cluster.local:9000
+        # reaches this mock (mimics in-cluster Service DNS).
+        aliases:
+          - mock-upstream.default.svc.cluster.local
 
   app:
     build:
@@ -80,9 +86,21 @@ services:
       MODELS_CONFIG_PATH: config/models.e2e.yaml
       API_KEY: e2e-test-key
       PHOENIX_TRACING_ENABLED: "false"
+      # Fast content-filter refresh so newly-created rules apply within seconds
+      # (default is 60s). The Test feature and proxy enforcement both read the
+      # cached rule set refreshed on this interval; a low value keeps e2e fast.
+      CONTENT_FILTER_REFRESH: "3"
       DISCOVERY_ENABLED: "true"
       DISCOVERY_PROBE_INTERVAL_SECONDS: "5"
       DISCOVERY_FAILURE_THRESHOLD: "2"
+      # Kubernetes service discovery (both = static models.yaml + discovered).
+      # Uses the FAKE lister reading a JSON file (no real cluster); edit the file
+      # to add/remove "services" live.
+      DISCOVERY_MODE: both
+      DISCOVERY_K8S_FAKE_SERVICES_FILE: /app/docker/k8s_fake_services.json
+      DISCOVERY_K8S_RESYNC_SECONDS: "5"
+      DISCOVERY_K8S_NAMESPACES: default
+      DISCOVERY_K8S_CLUSTER_DOMAIN: svc.cluster.local
     volumes:
       - ./app:/app/app:ro
       - ./config:/app/config:ro

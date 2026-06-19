@@ -27,3 +27,7 @@ sqlparse>=0.4.0
 #   openinference-semantic-conventions
 #   opentelemetry-api
 #   opentelemetry-sdk
+#
+# Kubernetes service discovery — required only when DISCOVERY_MODE is
+# 'kubernetes' or 'both' AND not using a fake lister. The import is guarded.
+#   kubernetes-asyncio>=29.0.0

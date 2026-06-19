@@ -149,7 +149,21 @@
       "Bash(python3 -c 'import sys,json *)",
       "Bash(node /private/tmp/bucket-investigation/probe-delete.mjs)",
       "Bash(node /private/tmp/bucket-investigation/measure.mjs)",
-      "Bash(git --no-pager diff --stat HEAD -- app/api/admin.py app/services/permission.py app/static/app.js app/static/style.css)"
+      "Bash(git --no-pager diff --stat HEAD -- app/api/admin.py app/services/permission.py app/static/app.js app/static/style.css)",
+      "Bash(python3 -m py_compile app/core/config.py app/backends/base.py app/services/kubernetes_discovery.py)",
+      "Bash(python3 -m py_compile tests/test_kubernetes_discovery.py)",
+      "Bash(./docker/e2e_k8s_test.sh)",
+      "Bash(npx --version)",
+      "Bash(awk '/^function openModal/,/^}/' app/static/app.js)",
+      "Bash(awk '/^function toast/,/^}/' app/static/app.js)",
+      "Bash(awk '/def get_current_user_payload_from_request/,/^@router|^async def [a-z].*payload|^def [a-z]/' app/api/auth_routes.py)",
+      "Bash(npm install *)",
+      "Bash(npx playwright *)",
+      "Bash(awk '/def verify_ldap_user_exists/,/^def [a-z]/' app/auth/ldap_auth.py)",
+      "Bash(grep -vE \"trace\\\\.zip|video\\\\.webm|test-failed|attachment|show-trace|^\\\\s*$|────\")",
+      "Bash(grep -iB2 -A30 \"traceback\\\\|unhandled\\\\|service_account\\\\|service-account\")",
+      "Bash(awk '/async def get_db/,/^async def [a-z]|^def [a-z]/' app/db/mysql.py)",
+      "Bash(git -C /Users/kalpeshmulye/Development/llm-router diff -- app/services/service_account.py)"
     ]
   }
 }
