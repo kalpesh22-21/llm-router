@@ -374,6 +374,7 @@ body {
   border-radius: 12px;
   font-size: 11px;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .badge-green {
@@ -487,7 +488,7 @@ body {
 
 .table th {
   text-align: left;
-  padding: 10px 14px;
+  padding: 10px;
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
@@ -507,7 +508,7 @@ body {
 }
 
 .table td {
-  padding: 11px 14px;
+  padding: 11px 10px;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
 }
@@ -522,7 +523,7 @@ body {
 
 /* Truncating text cells */
 .cell-text {
-  max-width: 180px;
+  max-width: 150px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -545,11 +546,19 @@ body {
   font-size: 13px;
 }
 
+/* Keep the cell a normal table-cell so .table td's vertical-align:middle
+   centers the buttons. flex on the <td> itself defeats that and top-aligns
+   the row's actions. Lay the buttons out as inline children instead. */
 .actions {
-  display: flex;
-  gap: 5px;
-  flex-wrap: nowrap;
-  align-items: center;
+  white-space: nowrap;
+}
+
+.actions > * {
+  vertical-align: middle;
+}
+
+.actions > * + * {
+  margin-left: 5px;
 }
 
 /* Placeholder for empty action cells to maintain alignment */
@@ -1228,9 +1237,60 @@ body {
     grid-template-columns: 1fr;
     padding: 16px;
   }
-  
+
   .model-selector select {
     min-width: 200px;
     width: 100%;
   }
+}
+
+/* ─── Assign Users modal ────────────────────────────────────────────────────── */
+.assign-users-list {
+  max-height: 320px;
+}
+
+.assign-users-default-note {
+  font-size: 12px;
+  color: var(--warning);
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  margin-bottom: 12px;
+}
+
+.assign-users-email {
+  font-size: 11px;
+  color: var(--muted);
+  margin-left: 6px;
+}
+
+/* ─── API Key one-time reveal ───────────────────────────────────────────────── */
+.api-key-reveal {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.api-key-reveal-warning {
+  font-size: 13px;
+  font-weight: 600;
+  color: #b45309;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: var(--radius);
+  padding: 10px 14px;
+}
+
+.api-key-reveal-input {
+  flex: 1;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #f8fafc;
+  color: var(--text);
+  word-break: break-all;
+  min-width: 0;
 }

@@ -1,0 +1,102 @@
+# =============================================================================
+# Discovery-service E2E harness (standalone — does NOT use the stale root compose)
+# =============================================================================
+# Services: mysql, redis, mock-upstream (toggleable), app.
+# The app is configured static-only (config/models.e2e.yaml) pointing at the
+# mock upstream. Stop/start mock-upstream to simulate a model going down/up.
+#
+#   docker compose -f docker-compose.e2e.yml up -d --build
+#   ./docker/e2e_test.sh
+#
+# No stubs: sqlparse is in requirements.txt and the optional deps (paycompy,
+# phoenix/openinference/opentelemetry) are guarded in code, so the app boots
+# without them. VAULT_ENABLED=false so Vault isn't used and the JWT fail-closed
+# guard isn't reached. The docker/stubs/ dir is no longer needed.
+# =============================================================================
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: llm_router
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-ppassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks: [e2e]
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [e2e]
+
+  mock-upstream:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llm-router-e2e:latest
+    command: ["uvicorn", "docker.mock_upstream:app", "--host", "0.0.0.0", "--port", "9000"]
+    volumes:
+      - ./docker:/app/docker:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [e2e]
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llm-router-e2e:latest
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      VAULT_ENABLED: "false"
+      JWT_SECRET_KEY: e2e-secret-not-for-production-0123456789abcdef
+      JWT_ALGORITHM: HS256
+      JWT_EXPIRE_MINUTES: "60"
+      DATABASE_HOST: mysql
+      DATABASE_PORT: "3306"
+      DATABASE_USER: root
+      DATABASE_PASSWORD: password
+      DATABASE_NAME: llm_router
+      DATABASE_DRIVER: mysql+aiomysql
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # 'admin' used to corrupt to 'admi' via the StrippedString bug — now fixed,
+      # so this is preserved correctly (and the admin login below works).
+      SUPERUSER_USERNAME: admin
+      ADMIN_INITIAL_PASSWORD: admin123
+      MODELS_CONFIG_PATH: config/models.e2e.yaml
+      API_KEY: e2e-test-key
+      PHOENIX_TRACING_ENABLED: "false"
+      DISCOVERY_ENABLED: "true"
+      DISCOVERY_PROBE_INTERVAL_SECONDS: "5"
+      DISCOVERY_FAILURE_THRESHOLD: "2"
+    volumes:
+      - ./app:/app/app:ro
+      - ./config:/app/config:ro
+      - ./docker:/app/docker:ro
+      - ./tests:/app/tests:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mock-upstream:
+        condition: service_healthy
+    networks: [e2e]
+
+networks:
+  e2e:
+    driver: bridge

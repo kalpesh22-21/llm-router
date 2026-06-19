@@ -34,12 +34,15 @@ from typing import Annotated, Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
 from app.api.auth_routes import get_current_user
 from app.auth.ldap_auth import verify_ldap_user_exists
+from app.db.redis_client import get_redis
+from app.services.api_key import api_key_service
+from app.services.service_account import service_account_service
 from app.backends.base import registry as backend_registry
 from app.db.cluster_drain import (
     DrainState,
@@ -273,6 +276,54 @@ class SetDefaultModelRequest(BaseModel):
     model_id: str
 
 
+class UserMinItem(BaseModel):
+    id: int
+    username: str
+    email: Optional[str]
+    is_active: bool
+
+    model_config = {"from_attributes": True}
+
+
+class UsersAllResponse(BaseModel):
+    data: List[UserMinItem]
+    total: int
+
+
+class BatchBucketUsersRequest(BaseModel):
+    user_ids: List[int]
+
+    @field_validator("user_ids")
+    @classmethod
+    def validate_user_ids(cls, v: List[int]) -> List[int]:
+        """Dedupe, enforce positive ints, cap size defensively."""
+        if len(v) > 100000:
+            raise ValueError("Too many users in one request")
+        seen: set[int] = set()
+        result: List[int] = []
+        for uid in v:
+            if uid < 1:
+                raise ValueError("user_ids must be positive integers")
+            if uid not in seen:
+                seen.add(uid)
+                result.append(uid)
+        return result
+
+
+class BucketUsersResponse(BaseModel):
+    bucket_id: int
+    user_ids: List[int]
+    is_default: bool
+
+
+class SetBucketUsersResponse(BaseModel):
+    bucket_id: int
+    granted: int
+    revoked: int
+    unchanged: int
+    user_ids: List[int]
+
+
 # ---------------------------------------------------------------------------
 # User management routes (admin+)
 # ---------------------------------------------------------------------------
@@ -331,6 +382,27 @@ async def create_user(
         email=email,
     )
     return UserResponse.model_validate(user)
+
+
+# NOTE: this static `/users/all` route MUST stay registered before the
+# parameterized `/users/{user_id}/...` routes below, or `all` would be
+# captured as a user_id. Do not reorder.
+@router.get("/users/all", response_model=UsersAllResponse)
+async def list_all_users(
+    _admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> UsersAllResponse:
+    """
+    Return every user (no pagination), ordered by username.
+
+    Intended for selection UIs that need the full user list in one call.
+    Response fields: id, username, email, is_active.
+    """
+    users = await permission_service.list_users_min(db)
+    return UsersAllResponse(
+        data=[UserMinItem.model_validate(u) for u in users],
+        total=len(users),
+    )
 
 
 @router.get("/users/{user_id}/buckets", response_model=List[int])
@@ -460,13 +532,6 @@ async def list_buckets(
 ) -> List[BucketResponse]:
     """List all buckets with their model assignments."""
     buckets = await permission_service.list_buckets(db)
-    available_model_ids = set(backend_registry.list_model_ids())
-    valid_buckets = list()
-    for bucket in buckets:
-        # Only include buckets that have at least one available model
-        bucket_model_ids = {model.model_id for model in bucket.models}
-        if bucket_model_ids and bucket_model_ids.intersection(available_model_ids):
-            valid_buckets.append(bucket)
     return [
         BucketResponse(
             id=b.id,
@@ -476,7 +541,7 @@ async def list_buckets(
             default_model=b.default_model,
             models=[BucketModelItem(model_id=m.model_id) for m in b.models],
         )
-        for b in valid_buckets
+        for b in buckets
     ]
 
 
@@ -616,6 +681,76 @@ async def update_bucket(
     )
 
 
+@router.delete("/buckets/{bucket_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_bucket(
+    bucket_id: int,
+    admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """
+    Delete a bucket along with all of its model assignments and access grants.
+
+    The default bucket cannot be deleted (409 Conflict); set another bucket as
+    the default first.
+    """
+    await permission_service.delete_bucket(
+        db, bucket_id=bucket_id, by_user_id=admin.id
+    )
+
+
+@router.get("/buckets/{bucket_id}/users", response_model=BucketUsersResponse)
+async def get_bucket_users(
+    bucket_id: int,
+    _admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> BucketUsersResponse:
+    """
+    Return the explicit user membership of a bucket.
+
+    ``user_ids`` contains only users with an explicit UserBucketAccess row;
+    the implicit grant that the default bucket gives to every user is NOT
+    reflected here.  ``is_default`` signals that this bucket is the default
+    so the UI can warn that explicit grants on it are redundant.
+    """
+    user_ids = await permission_service.get_bucket_user_ids(db, bucket_id)
+    bucket = await permission_service.get_bucket(db, bucket_id)
+    return BucketUsersResponse(
+        bucket_id=bucket_id,
+        user_ids=sorted(user_ids),
+        is_default=bucket.is_default,
+    )
+
+
+@router.post("/buckets/{bucket_id}/users", response_model=SetBucketUsersResponse)
+async def set_bucket_users(
+    bucket_id: int,
+    body: BatchBucketUsersRequest,
+    admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Batch set the explicit membership of a bucket (set-semantics).
+
+    The explicit UserBucketAccess rows for *bucket_id* are made to equal
+    exactly the deduplicated ``user_ids`` in the request body.  Users
+    currently granted access who are absent from the list are revoked;
+    users in the list who are not yet granted are inserted.
+
+    An empty ``user_ids`` list is valid and revokes all explicit grants.
+
+    Returns:
+        JSON with ``bucket_id``, ``granted``, ``revoked``, ``unchanged``,
+        and ``user_ids`` (sorted final membership).
+    """
+    result = await permission_service.set_bucket_users(
+        db,
+        bucket_id=bucket_id,
+        user_ids=body.user_ids,
+        by_user_id=admin.id,
+    )
+    return {"bucket_id": bucket_id, **result}
+
+
 @router.get("/models")
 async def list_all_models(
     _admin: Annotated[User, Depends(require_admin)],
@@ -625,6 +760,32 @@ async def list_all_models(
         {"id": mid, "object": "model", "owned_by": "llm-router"}
         for mid in sorted(backend_registry.list_model_ids())
     ]
+    return JSONResponse(content={"object": "list", "data": data})
+
+
+@router.get("/models/status")
+async def models_status(
+    _admin: Annotated[User, Depends(require_admin)],
+) -> JSONResponse:
+    """
+    Per-model availability as tracked by the DiscoveryService (this pod's view).
+
+    For static backends `available` reflects the most recent health probe;
+    backends with their own health machinery (multi-cluster) report available
+    here and manage routing internally.
+    """
+    data = []
+    for mid in sorted(backend_registry.list_model_ids()):
+        backend = backend_registry.get(mid)
+        if backend is None:
+            continue
+        data.append(
+            {
+                "model_id": mid,
+                "type": type(backend).__name__,
+                "available": backend.is_available,
+            }
+        )
     return JSONResponse(content={"object": "list", "data": data})
 
 
@@ -1355,3 +1516,369 @@ async def disable_cluster(
     runtime_stats = await _get_runtime_stats(model_id, cluster_id)
 
     return _cluster_to_response(cluster, model_id, runtime_stats, local_cluster_id)
+
+
+# ---------------------------------------------------------------------------
+# Service account management routes (admin+)
+# ---------------------------------------------------------------------------
+
+
+class ServiceAccountResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    owner_team: Optional[str]
+    is_active: bool
+    max_concurrent_requests: int
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
+    created_by: Optional[int]
+
+    model_config = {"from_attributes": True}
+
+
+class CreateServiceAccountRequest(BaseModel):
+    name: str
+    description: Optional[str] = None
+    owner_team: Optional[str] = None
+    max_concurrent_requests: Optional[int] = None
+    bucket_ids: Optional[List[int]] = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        if not v:
+            raise ValueError("Name cannot be empty")
+        if len(v) < 3:
+            raise ValueError("Name must be at least 3 characters long")
+        if len(v) > 255:
+            raise ValueError("Name must be at most 255 characters long")
+        if not re.match(r"^[a-zA-Z0-9_.-]+$", v):
+            raise ValueError(
+                "Name can only contain letters, numbers, underscores, hyphens, and dots"
+            )
+        return v
+
+    @field_validator("max_concurrent_requests")
+    @classmethod
+    def validate_max_concurrent(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 1:
+            raise ValueError("max_concurrent_requests must be >= 1")
+        return v
+
+
+class SetServiceActiveRequest(BaseModel):
+    is_active: bool
+
+
+class IssueKeyRequest(BaseModel):
+    name: str
+    scopes: Optional[List[str]] = None
+    model_ids: Optional[List[str]] = None
+    max_concurrent_requests: Optional[int] = None
+    expires_in_days: Optional[int] = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        if not v:
+            raise ValueError("Key name cannot be empty")
+        if len(v) > 100:
+            raise ValueError("Key name must be at most 100 characters long")
+        return v
+
+    @field_validator("expires_in_days")
+    @classmethod
+    def validate_expires(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 1:
+            raise ValueError("expires_in_days must be >= 1")
+        return v
+
+    @field_validator("max_concurrent_requests")
+    @classmethod
+    def validate_max_concurrent(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 1:
+            raise ValueError("max_concurrent_requests must be >= 1")
+        return v
+
+
+class IssueKeyResponse(BaseModel):
+    id: int
+    name: str
+    prefix: str
+    scopes: Optional[List[str]]
+    model_ids: Optional[List[str]]
+    max_concurrent_requests: Optional[int]
+    expires_at: Optional[datetime.datetime]
+    created_at: datetime.datetime
+    api_key: str = Field(
+        description="Plaintext API key — shown exactly once. Store it now; it cannot be retrieved later."
+    )
+
+    model_config = {"from_attributes": True}
+
+
+class ApiKeyMetaResponse(BaseModel):
+    """Key metadata returned on list — NEVER includes the secret or hash."""
+    id: int
+    name: str
+    prefix: str
+    scopes: Optional[List[str]]
+    model_ids: Optional[List[str]]
+    max_concurrent_requests: Optional[int]
+    created_at: datetime.datetime
+    expires_at: Optional[datetime.datetime]
+    last_used_at: Optional[datetime.datetime]
+    revoked_at: Optional[datetime.datetime]
+
+    model_config = {"from_attributes": True}
+
+
+@router.post(
+    "/service-accounts",
+    response_model=ServiceAccountResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_service_account(
+    body: CreateServiceAccountRequest,
+    admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> ServiceAccountResponse:
+    """
+    Create a service account.
+
+    Service accounts are not LDAP users — they authenticate via opaque API keys
+    issued at POST /admin/service-accounts/{service_id}/keys.
+    Optionally grant immediate bucket access via bucket_ids.
+    """
+    account = await service_account_service.create_service_account(
+        db,
+        name=body.name,
+        description=body.description,
+        owner_team=body.owner_team,
+        max_concurrent_requests=body.max_concurrent_requests,
+        bucket_ids=body.bucket_ids,
+        by_user_id=admin.id,
+    )
+    return ServiceAccountResponse.model_validate(account)
+
+
+@router.get("/service-accounts", response_model=List[ServiceAccountResponse])
+async def list_service_accounts(
+    _admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> List[ServiceAccountResponse]:
+    """List all service accounts (metadata only)."""
+    accounts = await service_account_service.list_service_accounts(db)
+    return [ServiceAccountResponse.model_validate(a) for a in accounts]
+
+
+@router.get(
+    "/service-accounts/{service_id}",
+    response_model=ServiceAccountResponse,
+)
+async def get_service_account(
+    service_id: int,
+    _admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> ServiceAccountResponse:
+    """Get a single service account by ID."""
+    account = await service_account_service.get_service_account(db, service_id)
+    return ServiceAccountResponse.model_validate(account)
+
+
+@router.patch(
+    "/service-accounts/{service_id}/active",
+    response_model=ServiceAccountResponse,
+)
+async def set_service_account_active(
+    service_id: int,
+    body: SetServiceActiveRequest,
+    admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+) -> ServiceAccountResponse:
+    """Activate or deactivate a service account.
+
+    On deactivation all active key cache entries are evicted immediately so
+    the account is rejected on the next request rather than after the cache TTL.
+    """
+    account = await service_account_service.set_active(
+        db, service_id=service_id, is_active=body.is_active, by_user_id=admin.id
+    )
+    if not body.is_active:
+        await api_key_service.evict_service_cache(db, redis, service_id)
+    return ServiceAccountResponse.model_validate(account)
+
+
+@router.post(
+    "/service-accounts/{service_id}/buckets/{bucket_id}",
+    status_code=status.HTTP_201_CREATED,
+)
+async def grant_service_bucket_access(
+    service_id: int,
+    bucket_id: int,
+    admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Grant a service account access to a bucket."""
+    # Verify the service account exists first
+    await service_account_service.get_service_account(db, service_id)
+    await service_account_service.grant_bucket_access(
+        db, service_id=service_id, bucket_id=bucket_id, by_user_id=admin.id
+    )
+    return {"detail": f"Access granted: service {service_id} -> bucket {bucket_id}"}
+
+
+@router.delete(
+    "/service-accounts/{service_id}/buckets/{bucket_id}",
+    status_code=status.HTTP_200_OK,
+)
+async def revoke_service_bucket_access(
+    service_id: int,
+    bucket_id: int,
+    admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Revoke a service account's access to a bucket."""
+    await service_account_service.get_service_account(db, service_id)
+    await service_account_service.revoke_bucket_access(
+        db, service_id=service_id, bucket_id=bucket_id, by_user_id=admin.id
+    )
+    return {"detail": f"Access revoked: service {service_id} -/-> bucket {bucket_id}"}
+
+
+@router.get(
+    "/service-accounts/{service_id}/buckets",
+    response_model=List[int],
+)
+async def list_service_bucket_ids(
+    service_id: int,
+    _admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> List[int]:
+    """List bucket IDs explicitly granted to a service account.
+
+    Only buckets that have at least one currently-available backend model are
+    returned, matching the availability filter applied by
+    ``GET /admin/users/{user_id}/buckets``.
+    """
+    await service_account_service.get_service_account(db, service_id)
+    available_model_ids = set(backend_registry.list_model_ids())
+    return await service_account_service.list_bucket_ids(
+        db, service_id, available_model_ids=available_model_ids
+    )
+
+
+@router.post(
+    "/service-accounts/{service_id}/keys",
+    response_model=IssueKeyResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def issue_key(
+    service_id: int,
+    body: IssueKeyRequest,
+    admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> IssueKeyResponse:
+    """
+    Issue a new API key for a service account.
+
+    The plaintext key is returned in the ``api_key`` field and shown EXACTLY
+    ONCE. It is not stored anywhere in the system. Store it securely immediately.
+    """
+    # Verify the service account exists
+    account = await service_account_service.get_service_account(db, service_id)
+
+    # Fix 3: block key issuance for inactive accounts
+    if not account.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot issue a key for an inactive service account",
+        )
+
+    # Fix 4: validate requested model_ids against the account's actual access
+    if body.model_ids:
+        available_model_ids = set(backend_registry.list_model_ids())
+        account_accessible = set(
+            await service_account_service.get_accessible_models(
+                db, service_id, available_model_ids=available_model_ids
+            )
+        )
+        bad = set(body.model_ids) - account_accessible
+        if bad:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"model_ids not accessible to this service account: {sorted(bad)}",
+            )
+
+    expires_at: Optional[datetime.datetime] = None
+    if body.expires_in_days is not None:
+        expires_at = datetime.datetime.utcnow() + datetime.timedelta(days=body.expires_in_days)
+
+    row, plaintext_key = await api_key_service.create_key(
+        db,
+        service_id=service_id,
+        name=body.name,
+        scopes=body.scopes,
+        model_ids=body.model_ids,
+        max_concurrent_requests=body.max_concurrent_requests,
+        expires_at=expires_at,
+        created_by=admin.id,
+    )
+
+    return IssueKeyResponse(
+        id=row.id,
+        name=row.name,
+        prefix=row.prefix,
+        scopes=row.scopes,
+        model_ids=row.model_ids,
+        max_concurrent_requests=row.max_concurrent_requests,
+        expires_at=row.expires_at,
+        created_at=row.created_at,
+        api_key=plaintext_key,
+    )
+
+
+@router.get(
+    "/service-accounts/{service_id}/keys",
+    response_model=List[ApiKeyMetaResponse],
+)
+async def list_keys(
+    service_id: int,
+    _admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> List[ApiKeyMetaResponse]:
+    """
+    List API keys for a service account.
+
+    Returns metadata only — the secret and hash are NEVER returned.
+    """
+    await service_account_service.get_service_account(db, service_id)
+    keys = await api_key_service.list_keys(db, service_id)
+    return [ApiKeyMetaResponse.model_validate(k) for k in keys]
+
+
+@router.delete(
+    "/service-accounts/{service_id}/keys/{key_id}",
+    status_code=status.HTTP_200_OK,
+)
+async def revoke_key(
+    service_id: int,
+    key_id: int,
+    admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+) -> dict:
+    """
+    Revoke a service account API key (soft delete).
+
+    The key is rejected on the next request. The Redis cache entry is also
+    evicted immediately so rejection is near-instant rather than waiting for
+    the cache TTL.
+    """
+    await service_account_service.get_service_account(db, service_id)
+    await api_key_service.revoke_key(
+        db, redis, key_id=key_id, service_id=service_id
+    )
+    return {"detail": f"API key {key_id} revoked"}

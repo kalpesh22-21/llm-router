@@ -55,6 +55,7 @@ from app.db.mysql import create_all_tables, run_migrations, engine, AsyncSession
 from app.db.redis_client import close_redis, init_redis
 from app.core.httpx import close_http_client
 from app.services.cross_pod_sync_service import cross_pod_sync_service
+from app.services.discovery_service import discovery_service
 from app.services.drain_monitor import drain_monitor
 from sqlalchemy import select
 
@@ -183,6 +184,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.error("Failed to build backend registry: %s", exc)
         raise
 
+    # 3.5. Start the discovery service: run an initial probe of static backends
+    # (so availability is correct before serving) and keep it in sync in the
+    # background, so a down model returns 503 and auto-recovers without restart.
+    try:
+        await discovery_service.start()
+        logger.info("Discovery service started")
+    except Exception as exc:
+        logger.warning("Discovery service failed to start (non-critical): %s", exc)
+
     # 4. Sync YAML config to database (must happen after DB tables exist)
     try:
         await cross_pod_sync_service.initialize_from_yaml()
@@ -245,7 +255,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("Drain monitor service stopped")
     except Exception as exc:
         logger.warning("Error stopping drain monitor service: %s", exc)
-    
+
+    try:
+        await discovery_service.stop()
+        logger.info("Discovery service stopped")
+    except Exception as exc:
+        logger.warning("Error stopping discovery service: %s", exc)
+
     await close_redis()
     await close_http_client()
     await engine.dispose()

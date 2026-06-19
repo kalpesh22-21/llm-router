@@ -1,0 +1,6 @@
+# E2E discovery test config — a single STATIC model pointing at the mock upstream.
+# We stop/start the mock-upstream container to simulate the model going down/up.
+models:
+  - model_id: test-model
+    base_url: http://mock-upstream:9000/v1
+    api_key: ""

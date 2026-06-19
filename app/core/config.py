@@ -39,14 +39,35 @@ from pydantic import (
     field_validator,
 )
 from pydantic_settings import BaseSettings
-from paycompy import vault
+
+# paycompy is an internal package, only needed when VAULT_ENABLED=true. Guard the
+# import so the app boots without it (e.g. local/dev, or any env using plain env
+# vars instead of Vault). load_settings_from_vault() raises clearly if Vault is
+# enabled but paycompy is missing.
+try:
+    from paycompy import vault
+except ImportError:
+    vault = None
 
 from app.utils.api_key_validator import find_working_api_key
 
 logger = logging.getLogger(__name__)
 
 
-StrippedString = Annotated[str, AfterValidator(lambda x: x.strip("\\n").strip("\n"))]
+def _strip_config_value(value: str) -> str:
+    """
+    Trim surrounding whitespace/newlines and remove any literal ``\\n`` escape
+    sequences from a config string.
+
+    NB: the previous implementation used ``value.strip("\\n")``, which strips the
+    *characters* ``\\`` and ``n`` from the ends — silently corrupting any value
+    ending in ``n`` (e.g. ``"admin"`` -> ``"admi"``). This removes the two-char
+    ``\\n`` sequence and trims real whitespace instead.
+    """
+    return value.replace("\\n", "").strip()
+
+
+StrippedString = Annotated[str, AfterValidator(_strip_config_value)]
 
 
 class ModelConfig:
@@ -292,6 +313,23 @@ class Settings(BaseSettings):
         env="CONCURRENT_TTL_SECONDS",
     )
 
+    # Discovery / health-probe service (static backends only)
+    DISCOVERY_ENABLED: bool = Field(
+        default=True,
+        description="Enable the background DiscoveryService that probes static backends.",
+        env="DISCOVERY_ENABLED",
+    )
+    DISCOVERY_PROBE_INTERVAL_SECONDS: int = Field(
+        default=15,
+        description="Seconds between background availability probes per backend.",
+        env="DISCOVERY_PROBE_INTERVAL_SECONDS",
+    )
+    DISCOVERY_FAILURE_THRESHOLD: int = Field(
+        default=2,
+        description="Consecutive failed probes before a backend is marked unavailable.",
+        env="DISCOVERY_FAILURE_THRESHOLD",
+    )
+
     CONTENT_FILTER_REFRESH: int = Field(
         default=60,
         description="Refresh frequency in seconds for filters",
@@ -354,11 +392,19 @@ class Settings(BaseSettings):
         env="ROUTER_CLUSTER_ID",
     )
 
+    # Service account API key cache TTL
+    SERVICE_API_KEY_CACHE_TTL_SECONDS: int = Field(
+        default=60,
+        description="TTL in seconds for the resolved service-account identity Redis cache",
+        env="SERVICE_API_KEY_CACHE_TTL_SECONDS",
+    )
+
     # ------------------------------------------------------------------ #
     # Derived helpers
     # ------------------------------------------------------------------ #
     async def load_model_configs(
         self,
+        skip_unavailable: bool = True,
     ) -> List[Union[ModelConfig, MultiClusterModelConfig]]:
         """
         Parse MODELS_CONFIG_PATH and return one config object per model.
@@ -367,6 +413,12 @@ class Settings(BaseSettings):
         Multi-cluster models (`type: multi_cluster`)       → MultiClusterModelConfig.
 
         Empty api_key fields fall back to the global API_KEY env var.
+
+        skip_unavailable: when True (default, legacy behaviour) static models that
+        are unreachable at startup or have no usable key are dropped. When False
+        (used by build_registry_from_config for the DiscoveryService) they are
+        kept with a best-effort key so a backend is still registered and the
+        discovery loop can mark it available + re-resolve the key on recovery.
         """
         path = self.MODELS_CONFIG_PATH
         if not os.path.isabs(path):
@@ -388,18 +440,29 @@ class Settings(BaseSettings):
                     api_key = await find_working_api_key(
                         base_url=base_url, API_Keys=self.VAULT_API_KEYs
                     )
-                except:
-                    logger.warning(f"Skipping {entry['model_id']} failed to connect.")
-                    continue
-                if api_key == "" :
-                    if self.API_KEY == "EMPTY":
-                        logger.warning(
-                            f"Skipping {entry['model_id']} since no API key in vault is applicable and default key is not set."
-                        )
+                except Exception:
+                    if skip_unavailable:
+                        logger.warning(f"Skipping {entry['model_id']} failed to connect.")
                         continue
+                    # Discovery mode: register anyway; the DiscoveryService will
+                    # probe and re-resolve a working key once it recovers.
+                    logger.warning(
+                        "%s unreachable at startup; registering as unavailable.",
+                        entry["model_id"],
+                    )
+                    api_key = ""
+                if api_key == "":
+                    if self.API_KEY == "EMPTY":
+                        if skip_unavailable:
+                            logger.warning(
+                                f"Skipping {entry['model_id']} since no API key in vault is applicable and default key is not set."
+                            )
+                            continue
+                        # No usable key yet — register keyless; discovery re-resolves.
+                        api_key = ""
                     else:
                         api_key = self.API_KEY
-                        
+
                 configs.append(
                     ModelConfig(
                         model_id=entry["model_id"],
@@ -492,6 +555,12 @@ def load_settings_from_vault() -> Settings:
     # If Vault is not enabled, return settings as-is
     if not settings.VAULT_ENABLED:
         return settings
+
+    if vault is None:
+        raise RuntimeError(
+            "VAULT_ENABLED=true but the internal 'paycompy' package is not "
+            "installed. Install paycompy or set VAULT_ENABLED=false."
+        )
 
     # Initialize Vault settings loader
     vc = vault.get_client_using_os_environ()

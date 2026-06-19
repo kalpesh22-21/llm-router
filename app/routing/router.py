@@ -40,6 +40,16 @@ class ModelRouter:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Model {model_id!r} is not available",
             )
+        if not backend.is_available:
+            # Registered but the upstream is currently down (per DiscoveryService).
+            # 503 (not 404) so clients can distinguish "unknown model" from
+            # "temporarily unavailable" and retry.
+            logger.warning("Backend for model_id=%r is currently unavailable", model_id)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Model {model_id!r} is temporarily unavailable. Please retry.",
+                headers={"Retry-After": "30"},
+            )
         return backend
 
     def list_available_model_ids(self) -> list[str]:

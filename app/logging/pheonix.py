@@ -3,10 +3,21 @@ from functools import wraps
 import logging
 import traceback
 from typing import Any, Dict
-from opentelemetry.trace import Status, StatusCode
-from openinference.semconv.trace import SpanAttributes
-from phoenix.otel import register
-from openinference.instrumentation.openai import OpenAIInstrumentor
+
+# Tracing libraries are optional — only needed when PHOENIX_TRACING_ENABLED=true.
+# Guard the imports so the app boots without them; get_tracing_config() degrades
+# to a no-op tracer if they're absent.
+try:
+    from opentelemetry.trace import Status, StatusCode
+    from openinference.semconv.trace import SpanAttributes
+    from phoenix.otel import register
+    from openinference.instrumentation.openai import OpenAIInstrumentor
+
+    _TRACING_DEPS_AVAILABLE = True
+except ImportError:
+    Status = StatusCode = SpanAttributes = register = OpenAIInstrumentor = None
+    _TRACING_DEPS_AVAILABLE = False
+
 from pydantic import BaseModel
 
 from app.core.config import settings
@@ -213,6 +224,14 @@ class Tracing:
 
 def get_tracing_config():
     if not settings.PHOENIX_TRACING_ENABLED:
+        return Tracing(tracing_enabled=False)
+
+    if not _TRACING_DEPS_AVAILABLE:
+        logger.warning(
+            "PHOENIX_TRACING_ENABLED=true but tracing libraries "
+            "(phoenix / openinference / opentelemetry) are not installed; "
+            "tracing is disabled."
+        )
         return Tracing(tracing_enabled=False)
 
     if settings.PHEONIX_API_KEY:

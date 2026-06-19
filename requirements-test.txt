@@ -1,0 +1,8 @@
+# Test-only dependencies — install alongside requirements.txt when running tests
+# inside the app image or a dev virtualenv:
+#
+#   pip install -r requirements.txt -r requirements-test.txt
+#   VAULT_ENABLED=false pytest tests/ -v
+#
+pytest>=7.4.0
+aiosqlite>=0.19.0

@@ -21,13 +21,13 @@ from app.auth.ldap_auth import authenticate_ldap, get_ldap_user_info
 from app.backends.base import registry as backend_registry
 from app.core.config import get_settings
 from app.db.mysql import User, get_db
+from app.db.redis_client import get_redis
 from app.services.permission import permission_service
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-_bearer = HTTPBearer(auto_error=True)
 _bearer_optional = HTTPBearer(auto_error=False)
 
 # ---------------------------------------------------------------------------
@@ -58,34 +58,36 @@ class UserResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Dependency: extract and validate JWT from Authorization header
+# Dependency: extract and validate credentials from request
 # ---------------------------------------------------------------------------
-
-
-async def get_current_user_payload(
-    credentials: Annotated[HTTPAuthorizationCredentials, Depends(_bearer)],
-) -> dict:
-    """Extract and decode the Bearer JWT. Raises 401 on failure."""
-    return decode_token(credentials.credentials)
 
 
 async def get_current_user_payload_from_request(
     request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_optional)] = None,
+    db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
 ) -> dict:
     """
-    Extract and decode JWT from x-api-key header (Anthropic SDK compatible),
-    falling back to Authorization: Bearer header.
+    Unified auth resolver — accepts BOTH service API keys and JWTs from EITHER
+    the x-api-key header or the Authorization: Bearer header.
 
-    Tries each present credential in priority order (x-api-key first, then
-    Bearer).  If one fails to decode the next is tried, so a non-JWT value in
-    x-api-key (e.g. a placeholder or upstream vLLM key) does not block a valid
-    router JWT supplied via Authorization: Bearer.
+    Resolution order (x-api-key takes priority over Bearer):
+      1. If the candidate starts with the service-key prefix → resolve as
+         an opaque service key (Redis cache → DB).  On success return payload.
+      2. Otherwise attempt JWT decode.  On success return payload.
+      3. Try next candidate.
+      4. If no candidate resolves → 401.
+
+    This is the single source of truth for all proxy and admin endpoints.
     """
+    # Lazy import to avoid circular dependency at module load time
+    from app.services.api_key import api_key_service
+
     candidates: list[str] = []
-    api_key = (request.headers.get("x-api-key") or "").strip()
-    if api_key:
-        candidates.append(api_key)
+    api_key_header = (request.headers.get("x-api-key") or "").strip()
+    if api_key_header:
+        candidates.append(api_key_header)
     if credentials:
         candidates.append(credentials.credentials)
 
@@ -95,9 +97,18 @@ async def get_current_user_payload_from_request(
             detail="Missing authentication. Provide x-api-key or Authorization: Bearer header.",
         )
 
-    for token in candidates:
+    for candidate in candidates:
+        if candidate.startswith(api_key_service.KEY_PREFIX):
+            # Try to resolve as a service account API key
+            payload = await api_key_service.resolve_key(db, redis, candidate)
+            if payload is not None:
+                return payload
+            # Key prefix matches but key is invalid/revoked/expired — do NOT
+            # fall through to JWT decode for the same candidate; try next.
+            continue
+        # Try JWT decode
         try:
-            return decode_token(token)
+            return decode_token(candidate)
         except HTTPException:
             continue
 
@@ -108,11 +119,31 @@ async def get_current_user_payload_from_request(
     )
 
 
+async def get_current_user_payload(
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_optional)] = None,
+    db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
+) -> dict:
+    """
+    Delegates to the unified request-based resolver.
+
+    Kept as a named export so existing import sites outside this module do not
+    need to be changed — they all resolve through the same logic.
+    """
+    return await get_current_user_payload_from_request(request, credentials, db, redis)
+
+
 async def get_current_user(
-    payload: Annotated[dict, Depends(get_current_user_payload)],
+    payload: Annotated[dict, Depends(get_current_user_payload_from_request)],
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Resolve JWT payload to a User ORM object. Raises 401 if inactive."""
+    """Resolve a validated payload to a User ORM object. Raises 401 if inactive."""
+    if payload.get("auth") == "service":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Service accounts cannot access user/admin endpoints.",
+        )
     user_id = int(payload["sub"])
     user = await permission_service.get_user(db, user_id)
     if not user.is_active:
@@ -315,6 +346,12 @@ async def refresh_token(
     Validates the current token and user status, then issues a new token
     with fresh claims from the database and a fresh expiration time.
     """
+    if payload.get("auth") == "service":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Service accounts cannot obtain JWT tokens; authenticate with the API key directly.",
+        )
+
     user_id = int(payload["sub"])
 
     # Verify user still exists in database

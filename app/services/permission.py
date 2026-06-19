@@ -12,7 +12,7 @@ import logging
 from typing import List, Optional, Tuple
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
@@ -421,7 +421,7 @@ class PermissionService:
 
     async def get_default_model(self, db: AsyncSession) -> Optional[str]:
         """Return the default model ID from the default bucket, or None.
-        
+
         Cached in Redis with no TTL — only invalidated when explicitly set/cleared.
         """
         try:
@@ -431,7 +431,7 @@ class PermissionService:
                 return json.loads(cached) if cached != 'null' else None
         except Exception:
             pass  # Redis unavailable, fall through to DB
-        
+
         result = await db.execute(
             select(Bucket)
             .options(joinedload(Bucket.models))
@@ -442,14 +442,14 @@ class PermissionService:
             model = None
         else:
             model = bucket.default_model
-        
+
         # Cache result (including None) with no TTL so it persists until explicit invalidation
         try:
             redis = get_redis_pool()
             await redis.set(DEFAULT_MODEL_CACHE_KEY, json.dumps(model))
         except Exception:
             pass
-        
+
         return model
 
     async def set_default_model(
@@ -461,7 +461,7 @@ class PermissionService:
     ) -> Bucket:
         """Set a specific model as the default model on the bucket."""
         bucket = await self._get_bucket(db, bucket_id)
-        
+
         # Validate the model_id belongs to this bucket
         bucket_model_ids = {m.model_id for m in bucket.models}
         if bucket_model_ids and model_id not in bucket_model_ids:
@@ -469,7 +469,7 @@ class PermissionService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Model {model_id!r} is not in bucket {bucket_id!r}. Available models: {sorted(bucket_model_ids)}",
             )
-        
+
         bucket.default_model = model_id
         await db.flush()
 
@@ -479,7 +479,7 @@ class PermissionService:
             await redis.delete(DEFAULT_MODEL_CACHE_KEY)
         except Exception:
             pass
-        
+
         by_user = await self.get_user(db, by_user_id)
         logger.info(
             "Model %r set as default model on bucket %d by user %s",
@@ -516,7 +516,7 @@ class PermissionService:
             await redis.delete(DEFAULT_MODEL_CACHE_KEY)
         except Exception:
             pass
-        
+
         by_user = await self.get_user(db, by_user_id)
         logger.info("Bucket %d set as default by user %s", bucket_id, by_user.username)
         return new_default
@@ -625,6 +625,54 @@ class PermissionService:
 
         return bucket
 
+    async def delete_bucket(
+        self,
+        db: AsyncSession,
+        bucket_id: int,
+        by_user_id: int,
+    ) -> None:
+        """
+        Delete a bucket.
+
+        The bucket's model assignments (bucket_models) and access grants
+        (user_bucket_access, service_bucket_access) are removed automatically
+        via ON DELETE CASCADE at the database level.
+
+        Args:
+            db: Database session
+            bucket_id: ID of the bucket to delete
+            by_user_id: ID of the user making the change (for audit logging)
+
+        Raises:
+            HTTPException(404) if the bucket does not exist.
+            HTTPException(409) if the bucket is the default bucket.
+        """
+        bucket = await self._get_bucket(db, bucket_id)
+        if bucket.is_default:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "The default bucket cannot be deleted. "
+                    "Set another bucket as default first."
+                ),
+            )
+
+        name = bucket.name
+        # Core DELETE so the database's ON DELETE CASCADE removes the related
+        # bucket_models / user_bucket_access / service_bucket_access rows. A Core
+        # statement avoids the ORM trying to NULL the NOT NULL bucket_id FKs on
+        # the (non-cascaded) access relationships.
+        await db.execute(delete(Bucket).where(Bucket.id == bucket_id))
+        # Drop the now-deleted instance from the identity map so nothing in this
+        # session lazy-loads a relationship off the zombie object.
+        db.expunge(bucket)
+        await db.flush()
+
+        by_user = await self.get_user(db, by_user_id)
+        logger.info(
+            "Bucket %d (%r) deleted by user %s", bucket_id, name, by_user.username
+        )
+
     async def get_default_bucket(self, db: AsyncSession) -> Optional[Bucket]:
         """Return the bucket marked as default, or None if no default exists."""
         result = await db.execute(
@@ -643,6 +691,150 @@ class PermissionService:
         """Return total number of users in the database."""
         result = await db.execute(select(func.count()).select_from(User))
         return result.scalar_one()
+
+    async def list_users_min(self, db: AsyncSession) -> List[User]:
+        """
+        Return ALL users ordered by username, with no pagination.
+
+        Intended for selection UIs that need the full user list at once.
+        """
+        result = await db.execute(select(User).order_by(User.username))
+        users = list(result.scalars().all())
+        if len(users) > 5000:
+            logger.warning(
+                "list_users_min returned %d users — selection UIs may be slow; "
+                "consider server-side search/pagination",
+                len(users),
+            )
+        return users
+
+    async def get_bucket(self, db: AsyncSession, bucket_id: int) -> Bucket:
+        """
+        Public wrapper around _get_bucket.
+
+        Raises:
+            HTTPException(404) if the bucket does not exist.
+        """
+        return await self._get_bucket(db, bucket_id)
+
+    async def get_bucket_user_ids(self, db: AsyncSession, bucket_id: int) -> List[int]:
+        """
+        Return the list of user IDs that have an explicit UserBucketAccess row
+        for *bucket_id*.
+
+        Does not include the implicit grant that the default bucket gives to
+        every user — only rows that exist in the user_bucket_access table.
+
+        Raises:
+            HTTPException(404) if the bucket does not exist.
+        """
+        await self._get_bucket(db, bucket_id)
+        result = await db.execute(
+            select(UserBucketAccess.user_id).where(
+                UserBucketAccess.bucket_id == bucket_id
+            )
+        )
+        return [row[0] for row in result.all()]
+
+    async def set_bucket_users(
+        self,
+        db: AsyncSession,
+        bucket_id: int,
+        user_ids: List[int],
+        by_user_id: int,
+    ) -> dict:
+        """
+        Set-semantics batch membership update for a bucket.
+
+        Makes the explicit UserBucketAccess membership of *bucket_id* exactly
+        equal to the deduplicated *user_ids* list.  Users not in *user_ids* but
+        currently granted access have their grant revoked; users in *user_ids*
+        but not yet granted are inserted.  An empty *user_ids* list is valid and
+        revokes all explicit grants.
+
+        Args:
+            db: Database session.
+            bucket_id: The bucket whose membership is being set.
+            user_ids: Desired complete set of user IDs (duplicates ignored).
+            by_user_id: Admin user performing the operation (for audit logging).
+
+        Returns:
+            Dict with keys ``granted``, ``revoked``, ``unchanged``, and
+            ``user_ids`` (sorted final membership list).
+
+        Raises:
+            HTTPException(404) if bucket or by_user not found.
+            HTTPException(400) if any requested user_id does not exist.
+
+        Concurrency: no row-level lock is held during the read-modify-write
+        sequence; concurrent calls for the same bucket_id are last-write-wins.
+        The unique (user_id, bucket_id) constraint in the DB prevents duplicate
+        grant rows from being inserted.
+        """
+        await self._get_bucket(db, bucket_id)
+
+        desired: set[int] = set(user_ids)
+
+        # Validate all requested user IDs exist in a single query
+        if desired:
+            result = await db.execute(
+                select(User.id).where(User.id.in_(desired))
+            )
+            found_ids = {row[0] for row in result.all()}
+            missing = desired - found_ids
+            if missing:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Unknown user id(s): {sorted(missing)}",
+                )
+
+        # Fetch current explicit membership
+        result = await db.execute(
+            select(UserBucketAccess.user_id).where(
+                UserBucketAccess.bucket_id == bucket_id
+            )
+        )
+        current: set[int] = {row[0] for row in result.all()}
+
+        to_grant = desired - current
+        to_revoke = current - desired
+
+        # Insert new grants
+        for uid in to_grant:
+            db.add(
+                UserBucketAccess(
+                    user_id=uid,
+                    bucket_id=bucket_id,
+                    granted_by=by_user_id,
+                )
+            )
+
+        # Bulk-delete revoked grants (mirrors update_bucket's delete pattern)
+        if to_revoke:
+            await db.execute(
+                UserBucketAccess.__table__.delete().where(
+                    UserBucketAccess.__table__.c.bucket_id == bucket_id,
+                    UserBucketAccess.__table__.c.user_id.in_(to_revoke),
+                )
+            )
+
+        await db.flush()
+
+        by_user = await self.get_user(db, by_user_id)
+        logger.info(
+            "Bucket %d membership set by %s: +%d granted, -%d revoked",
+            bucket_id,
+            by_user.username,
+            len(to_grant),
+            len(to_revoke),
+        )
+
+        return {
+            "granted": len(to_grant),
+            "revoked": len(to_revoke),
+            "unchanged": len(desired & current),
+            "user_ids": sorted(desired),
+        }
 
     # ------------------------------------------------------------------ #
     # Internal helpers

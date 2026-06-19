@@ -128,7 +128,7 @@ class User(Base):
     is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Maximum number of simultaneous in-flight requests allowed for this user
     max_concurrent_requests: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=10
+        Integer, nullable=False, default=1
     )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
@@ -252,6 +252,171 @@ class UserBucketAccess(Base):
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<UserBucketAccess user_id={self.user_id} bucket_id={self.bucket_id}>"
+
+
+# ---------------------------------------------------------------------------
+# Service account models
+# ---------------------------------------------------------------------------
+
+
+class ServiceAccount(Base):
+    """
+    A named service identity that authenticates via opaque API keys.
+
+    Service accounts are NOT LDAP users — they live in a dedicated table
+    and have no password. All data-plane access goes through ApiKey resolution.
+    """
+
+    __tablename__ = "service_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Unique machine-readable name (used as username in payloads)
+    name: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True, index=True
+    )
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Owning team or person label (informational)
+    owner_team: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Account-level concurrency default — individual keys may override this
+    max_concurrent_requests: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=10
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    # Admin who created this account (nullable: SET NULL on user deletion)
+    created_by: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # Relationships
+    bucket_accesses: Mapped[list[ServiceBucketAccess]] = relationship(
+        "ServiceBucketAccess",
+        back_populates="service_account",
+        lazy="select",
+        cascade="all, delete-orphan",
+    )
+    api_keys: Mapped[list[ApiKey]] = relationship(
+        "ApiKey",
+        back_populates="service_account",
+        lazy="select",
+        cascade="all, delete-orphan",
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<ServiceAccount id={self.id} name={self.name!r}>"
+
+
+class ServiceBucketAccess(Base):
+    """
+    Records that a service account has been granted access to a bucket.
+
+    Parallel structure to UserBucketAccess but keyed on service_accounts.id.
+    """
+
+    __tablename__ = "service_bucket_access"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    service_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("service_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    bucket_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("buckets.id", ondelete="CASCADE"), nullable=False
+    )
+    granted_by: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    granted_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("service_id", "bucket_id", name="uq_service_bucket"),
+        Index("ix_service_bucket_access_service_id", "service_id"),
+        Index("ix_service_bucket_access_bucket_id", "bucket_id"),
+    )
+
+    # Relationships
+    service_account: Mapped[ServiceAccount] = relationship(
+        "ServiceAccount", back_populates="bucket_accesses"
+    )
+    bucket: Mapped[Bucket] = relationship("Bucket")
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<ServiceBucketAccess service_id={self.service_id} bucket_id={self.bucket_id}>"
+
+
+class ApiKey(Base):
+    """
+    Long-lived opaque API key belonging to a ServiceAccount.
+
+    The plaintext key is NEVER stored. Only the SHA-256 hex digest (key_hash)
+    and a non-secret prefix are persisted. The prefix is used for UI display
+    so admins can identify which key they are looking at without exposing the secret.
+
+    Lifecycle: a key is active when revoked_at IS NULL and (expires_at IS NULL or
+    expires_at > now). Revocation is soft — set revoked_at to reject on next request.
+
+    Per-key overrides (all nullable — NULL means "use account default"):
+      scopes      — list of operation scopes restricting this key; NULL/empty = all ops.
+      model_ids   — list of model_id strings further restricting model access; NULL/empty = all account models.
+      max_concurrent_requests — per-key concurrency cap; NULL = use account.max_concurrent_requests.
+    """
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # The service account this key belongs to
+    service_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("service_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    # Human-readable label, e.g. "ci-prod"
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Non-secret leading slice of the key (first 16 chars) for UI identification
+    prefix: Mapped[str] = mapped_column(String(32), nullable=False)
+    # SHA-256 hex digest of the full key — the lookup key; UNIQUE enforces one row per key
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # Admin who issued this key (nullable: SET NULL on user deletion)
+    created_by: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    # Optional expiry in naive UTC; NULL means the key never expires
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+    # Updated on each cache-miss resolution (throttled to once per cache TTL window)
+    last_used_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+    # Soft revocation timestamp; NULL means the key is active
+    revoked_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Per-key operation scope restriction — list of strings from {"chat","embeddings","messages","models"}
+    # NULL or empty list means all operations are allowed
+    scopes: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Per-key model subset — list of model_id strings; NULL or empty = all account models
+    model_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Per-key concurrency override; NULL = use account.max_concurrent_requests
+    max_concurrent_requests: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index("ix_api_keys_service_id", "service_id"),
+        Index("ix_api_keys_prefix", "prefix"),
+    )
+
+    # Relationships
+    service_account: Mapped[ServiceAccount] = relationship(
+        "ServiceAccount", back_populates="api_keys"
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<ApiKey id={self.id} name={self.name!r} service_id={self.service_id}>"
 
 
 class ContentFilterRule(Base):
@@ -457,17 +622,17 @@ async def run_migrations() -> None:
 
         def _columns_missing(sync_conn):
             inspector = inspect(sync_conn)
-            cols = [c["name"] for c in inspector.get_columns("buckets")]
+            buckets_cols = [c["name"] for c in inspector.get_columns("buckets")]
             missing = []
-            if "default_model" not in cols:
+            if "default_model" not in buckets_cols:
                 missing.append("default_model")
             return missing
 
         missing = await conn.run_sync(_columns_missing)
+        dialect = conn.dialect.name
 
         if "default_model" in missing:
             logger.warning("Column 'default_model' missing from 'buckets', adding it now...")
-            dialect = conn.dialect.name
             if dialect == "mysql":
                 alter_sql = (
                     "ALTER TABLE buckets "

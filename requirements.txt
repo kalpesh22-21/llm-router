@@ -10,3 +10,20 @@ pydantic-settings>=2.0.0
 pyyaml>=6.0
 prometheus-client>=0.20.0
 python-multipart>=0.0.9
+sqlparse>=0.4.0
+
+# ---------------------------------------------------------------------------
+# Optional / environment-specific dependencies
+# ---------------------------------------------------------------------------
+# Internal package — required only when VAULT_ENABLED=true (Vault) and for LDAP
+# auth. Install from your internal index. The app boots without it (imports are
+# guarded); Vault then errors clearly and LDAP auth degrades gracefully.
+#   paycompy
+#
+# Tracing — required only when PHOENIX_TRACING_ENABLED=true. The app boots
+# without these (imports are guarded) and runs with tracing disabled.
+#   arize-phoenix
+#   openinference-instrumentation-openai
+#   openinference-semantic-conventions
+#   opentelemetry-api
+#   opentelemetry-sdk

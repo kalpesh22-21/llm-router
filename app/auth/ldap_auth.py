@@ -23,9 +23,22 @@ from ldap3.utils.conv import escape_filter_chars
 
 from app.core.config import get_settings
 
-from paycompy import ldap
+# paycompy is an internal package. Guard the import so the app boots without it;
+# LDAP auth then degrades gracefully (authenticate_ldap returns False), which
+# lets the env-admin login path still work.
+try:
+    from paycompy import ldap
+except ImportError:
+    ldap = None
 
 logger = logging.getLogger(__name__)
+
+
+def _ldap_available() -> bool:
+    if ldap is None:
+        logger.warning("paycompy.ldap is not installed; LDAP auth is unavailable")
+        return False
+    return True
 settings = get_settings()
 
 
@@ -68,6 +81,8 @@ def authenticate_ldap(username: str, password: str) -> bool:
 
     Returns True on success, False on any failure.
     """
+    if not _ldap_available():
+        return False
     if not username or not password:
         return False
 
@@ -166,6 +181,8 @@ def get_ldap_user_info(username: str, password: str) -> Dict[str, str]:
 
     Returns an empty dict if the user is not found or LDAP is unreachable.
     """
+    if not _ldap_available():
+        return {}
     # Escape username and password to prevent LDAP injection
     escaped_username = _escape_ldap_username(username)
     escaped_password = _escape_ldap_password(password)
@@ -201,6 +218,8 @@ def verify_ldap_user_exists(username: str) -> bool:
     Uses a service account bind to search for the user in the directory.
     Returns True if the user exists, False otherwise.
     """
+    if not _ldap_available():
+        return False
     if not username:
         return False
 

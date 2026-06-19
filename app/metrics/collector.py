@@ -99,6 +99,12 @@ concurrent_requests = Gauge(
     ["model_id", "username"],
 )
 
+model_available = Gauge(
+    "llm_router_model_available",
+    "Whether a static backend's upstream is currently reachable (1=available, 0=down)",
+    ["model_id"],
+)
+
 
 # ---------------------------------------------------------------------------
 # MetricsCollector facade
@@ -221,6 +227,15 @@ class MetricsCollector:
             username:  String representation of the user's DB name.
         """
         concurrent_requests.labels(model_id=model_id, username=username).dec()
+
+    def set_model_available(self, model_id: str, available: bool) -> None:
+        """
+        Set the per-model availability gauge (1=available, 0=down).
+
+        Called by the DiscoveryService after each probe so the current
+        reachability of every static backend is visible at /metrics.
+        """
+        model_available.labels(model_id=model_id).set(1 if available else 0)
 
 
 # Module-level singleton

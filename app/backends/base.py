@@ -37,6 +37,18 @@ class Backend(ABC):
         """The canonical model identifier this backend serves."""
         ...
 
+    @property
+    def is_available(self) -> bool:
+        """
+        Whether this backend can currently serve requests.
+
+        Defaults to True. StaticBackend overrides this with health-probe state
+        maintained by the DiscoveryService. Backends with their own health
+        machinery (e.g. MultiClusterBackend) keep the default and manage
+        availability internally.
+        """
+        return True
+
     @abstractmethod
     async def forward(self, request: Request, body: dict,upstream_url:str) -> httpx.Response:
         """

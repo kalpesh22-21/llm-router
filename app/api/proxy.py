@@ -30,8 +30,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
-from app.api.auth_routes import get_current_user_payload, get_current_user_payload_from_request
-from app.backends.base import Backend
+from app.api.auth_routes import get_current_user_payload_from_request
+from app.backends.base import Backend, registry
 from app.db.mysql import get_db
 from app.db.redis_client import (
     get_redis,
@@ -59,26 +59,39 @@ async def _resolve_user(
     payload: dict,
     db: AsyncSession,
     redis: aioredis.Redis,
-) -> tuple[str, int, int]:
+) -> tuple[str, int | str, int]:
     """
-    Extract user info from JWT payload.
+    Extract user info from JWT payload and return the rate-limiting principal.
 
-    Checks DB for is_active status:
-    - Always if user is in the deactivated tracking set (was previously deactivated)
-    - Randomly (~1% of requests) for other users to catch newly deactivated users
+    For service keys (payload["auth"] == "service"):
+      - Skips the users-table is_active DB poll entirely. Service account
+        liveness is enforced during resolve_key (cache miss) and via
+        evict_service_cache on deactivation.
+      - Returns principal = payload["rate_principal"] (e.g. "svckey:{key_id}"),
+        which namespaces per-key concurrency counters away from user-id counters.
 
-    If a deactivated user is found, they are added to the tracking set.
-    If a tracked user is found active again, they are removed from tracking.
+    For human JWT users:
+      - Checks DB for is_active:
+          always  if user is in the deactivated tracking set,
+          ~1%     otherwise to catch newly deactivated users.
+      - Returns principal = int user_id.
 
     Returns:
-        (username, user_id, max_concurrent_requests)
+        (username, principal, max_concurrent_requests)
 
     Raises:
         HTTPException(401) if the user is inactive or not found.
     """
-    user_id = int(payload["sub"])
     username = payload["username"]
     max_concurrent = payload.get("max_concurrent_requests", 10)
+
+    if payload.get("auth") == "service":
+        # Service path: liveness already enforced at key resolution
+        principal: int | str = payload["rate_principal"]
+        return username, principal, max_concurrent
+
+    # Human JWT path
+    user_id = int(payload["sub"])
 
     # Check if user is in the deactivated tracking set
     is_tracked_deactivated = await is_user_marked_deactivated(redis, user_id)
@@ -105,6 +118,26 @@ async def _resolve_user(
             )
 
     return username, user_id, max_concurrent
+
+
+def _assert_scope(payload: dict, required: str) -> None:
+    """
+    Enforce operation scope restrictions for service API keys.
+
+    For human JWT users this is a no-op. For service keys, if the key was
+    issued with a non-empty scopes list the requested operation must be present.
+
+    Raises:
+        HTTPException(403) if the key is not authorized for *required*.
+    """
+    if payload.get("auth") != "service":
+        return
+    scopes = payload.get("scopes") or []
+    if scopes and required not in scopes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"This API key is not authorized for '{required}'",
+        )
 
 
 def _extract_usage(data: dict) -> tuple[int, int]:
@@ -179,7 +212,7 @@ async def _stream_response(
     upstream_url: str,
     body: dict,
     model_id: str,
-    user_id: int,
+    user_id: int | str,
     username: str,
     start_time: float,
     redis: aioredis.Redis,
@@ -308,7 +341,7 @@ async def _stream_response(
 )
 async def chat_completions(
     request: Request,
-    payload: Annotated[dict, Depends(get_current_user_payload)],
+    payload: Annotated[dict, Depends(get_current_user_payload_from_request)],
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ) -> StreamingResponse | JSONResponse:
@@ -338,8 +371,21 @@ async def chat_completions(
         )
 
     # Resolve and verify user
-    username, user_id, max_concurrent = await _resolve_user(payload, db, redis)
+    username, principal, max_concurrent = await _resolve_user(payload, db, redis)
     logger.debug(f"Took {time.monotonic() - request_landing_time} for resolving user")
+
+    # Scope check for service keys (no-op for JWT users)
+    _assert_scope(payload, "chat")
+
+    # Check model access from JWT claims (no DB call) — before content filter
+    # so unauthorized requests are rejected without wasting work scanning content.
+    accessible_models = set(payload.get("accessible_models", []))
+    if model_id not in accessible_models:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Model {model_id!r} is not accessible to this user",
+        )
+
     # Content filter check
     filter_result = await content_filter_service.check_request_body(body)
     logger.debug(f"Took {time.monotonic() - request_landing_time} for filtering user")
@@ -358,16 +404,12 @@ async def chat_completions(
                 detail=f"Content filter blocked: {error_message}",
             )
 
-    # Check model access from JWT claims (no DB call)
-    accessible_models = set(payload.get("accessible_models", []))
-    if model_id not in accessible_models:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Model {model_id!r} is not accessible to this user",
-        )
+    # Resolve the backend before touching the rate-limit counter so a resolution
+    # failure (HTTPException 503 etc.) never leaks an unreleased increment.
+    backend = model_router.resolve(model_id)
 
     # Rate limit: check-and-increment (raises 429 if exceeded)
-    await rate_limit_service.assert_within_limit(redis, user_id, max_concurrent)
+    await rate_limit_service.assert_within_limit(redis, principal, max_concurrent)
     metrics_collector.record_concurrent_increment(model_id=model_id, username=username)
 
     logger.debug(f"Took {time.monotonic() - request_landing_time} for redis")
@@ -375,7 +417,6 @@ async def chat_completions(
     is_streaming: bool = bool(body.get("stream", False))
 
     try:
-        backend = model_router.resolve(model_id)
         if is_streaming:
             return StreamingResponse(
                 _stream_response(
@@ -384,7 +425,7 @@ async def chat_completions(
                     upstream_url="/chat/completions",
                     body=body,
                     model_id=model_id,
-                    user_id=user_id,
+                    user_id=principal,
                     username=username,
                     start_time=start_time,
                     redis=redis,
@@ -452,7 +493,7 @@ async def chat_completions(
     finally:
         # Always decrement for non-streaming; streaming decrements inside generator
         if not is_streaming:
-            await rate_limit_service.decrement(redis, user_id)
+            await rate_limit_service.decrement(redis, principal)
             metrics_collector.record_concurrent_decrement(
                 model_id=model_id, username=username
             )
@@ -464,7 +505,7 @@ async def chat_completions(
 )
 async def embeddings(
     request: Request,
-    payload: Annotated[dict, Depends(get_current_user_payload)],
+    payload: Annotated[dict, Depends(get_current_user_payload_from_request)],
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ) -> JSONResponse:
@@ -488,7 +529,10 @@ async def embeddings(
             detail="'model' field is required",
         )
 
-    username, user_id, max_concurrent = await _resolve_user(payload, db, redis)
+    username, principal, max_concurrent = await _resolve_user(payload, db, redis)
+
+    # Scope check for service keys (no-op for JWT users)
+    _assert_scope(payload, "embeddings")
 
     # Check model access from JWT claims (no DB call)
     accessible_models = set(payload.get("accessible_models", []))
@@ -498,7 +542,7 @@ async def embeddings(
             detail=f"Model {model_id!r} is not accessible to this user",
         )
 
-    await rate_limit_service.assert_within_limit(redis, user_id, max_concurrent)
+    await rate_limit_service.assert_within_limit(redis, principal, max_concurrent)
     metrics_collector.record_concurrent_increment(model_id=model_id, username=username)
 
     start_time = time.monotonic()
@@ -546,7 +590,7 @@ async def embeddings(
             detail="Backend error",
         )
     finally:
-        await rate_limit_service.decrement(redis, user_id)
+        await rate_limit_service.decrement(redis, principal)
         metrics_collector.record_concurrent_decrement(
             model_id=model_id, username=username
         )
@@ -554,7 +598,7 @@ async def embeddings(
 
 @router.get("/models")
 async def list_models(
-    payload: Annotated[dict, Depends(get_current_user_payload)],
+    payload: Annotated[dict, Depends(get_current_user_payload_from_request)],
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ) -> JSONResponse:
@@ -566,13 +610,19 @@ async def list_models(
     """
     await _resolve_user(payload, db, redis)
 
+    # Scope check for service keys (no-op for JWT users)
+    _assert_scope(payload, "models")
+
     # Get models from JWT claims (no DB call)
     model_ids = payload.get("accessible_models", [])
 
-    data = [
-        {"id": mid, "object": "model", "owned_by": "llm-router"}
-        for mid in sorted(model_ids)
-    ]
+    # Hide models whose backend is currently unavailable (per DiscoveryService),
+    # and any that are no longer registered.
+    data = []
+    for mid in sorted(model_ids):
+        backend = registry.get(mid)
+        if backend is not None and backend.is_available:
+            data.append({"id": mid, "object": "model", "owned_by": "llm-router"})
 
     # Get the default model from the default bucket
     default_model = await permission_service.get_default_model(db)
@@ -621,8 +671,20 @@ async def messages(
         )
 
     # Resolve and verify user
-    username, user_id, max_concurrent = await _resolve_user(payload, db, redis)
+    username, principal, max_concurrent = await _resolve_user(payload, db, redis)
     logger.debug(f"Took {time.monotonic() - request_landing_time} for resolving user")
+
+    # Scope check for service keys (no-op for JWT users)
+    _assert_scope(payload, "messages")
+
+    # Check model access from JWT claims (no DB call) — before content filter
+    # so unauthorized requests are rejected without wasting work scanning content.
+    accessible_models = set(payload.get("accessible_models", []))
+    if model_id not in accessible_models:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Model {model_id!r} is not accessible to this user",
+        )
 
     # Content filter check
     filter_result = await content_filter_service.check_request_body(body)
@@ -641,16 +703,12 @@ async def messages(
                 detail=f"Content filter blocked: {error_message}",
             )
 
-    # Check model access from JWT claims (no DB call)
-    accessible_models = set(payload.get("accessible_models", []))
-    if model_id not in accessible_models:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Model {model_id!r} is not accessible to this user",
-        )
+    # Resolve the backend before touching the rate-limit counter so a resolution
+    # failure (HTTPException 503 etc.) never leaks an unreleased increment.
+    backend = model_router.resolve(model_id)
 
     # Rate limit: check-and-increment (raises 429 if exceeded)
-    await rate_limit_service.assert_within_limit(redis, user_id, max_concurrent)
+    await rate_limit_service.assert_within_limit(redis, principal, max_concurrent)
     metrics_collector.record_concurrent_increment(model_id=model_id, username=username)
 
     logger.debug(f"Took {time.monotonic() - request_landing_time} for redis")
@@ -658,7 +716,6 @@ async def messages(
     is_streaming: bool = bool(body.get("stream", False))
 
     try:
-        backend = model_router.resolve(model_id)
         if is_streaming:
             return StreamingResponse(
                 _stream_response(
@@ -667,7 +724,7 @@ async def messages(
                     upstream_url="/messages",
                     body=body,
                     model_id=model_id,
-                    user_id=user_id,
+                    user_id=principal,
                     username=username,
                     start_time=start_time,
                     redis=redis,
@@ -736,7 +793,7 @@ async def messages(
     finally:
         # Always decrement for non-streaming; streaming decrements inside generator
         if not is_streaming:
-            await rate_limit_service.decrement(redis, user_id)
+            await rate_limit_service.decrement(redis, principal)
             metrics_collector.record_concurrent_decrement(
                 model_id=model_id, username=username
             )

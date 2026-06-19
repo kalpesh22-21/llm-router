@@ -10,6 +10,8 @@ const S = {
   users: [],
   buckets: [],
   contentFilters: [],
+  serviceAccounts: [],
+  serviceAccountQuery: '',
   multiclusterModels: [],
   clusters: [],
   selectedClusterModel: null,
@@ -444,6 +446,10 @@ function renderShell() {
         <a class="nav-item" data-nav="multicluster" href="#/multicluster"
            onclick="navigate('multicluster', event)">
           <span>🌐</span> Multicluster
+        </a>
+        <a class="nav-item" data-nav="service-accounts" href="#/service-accounts"
+           onclick="navigate('service-accounts', event)">
+          <span>🤖</span> Service Accounts
         </a>` : ''}
       </nav>
       <div class="sidebar-footer">
@@ -470,7 +476,7 @@ function setActiveNav(id) {
 // Router
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VALID_VIEWS = ['dashboard', 'users', 'buckets', 'content-filters', 'multicluster']
+const VALID_VIEWS = ['dashboard', 'users', 'buckets', 'content-filters', 'multicluster', 'service-accounts']
 
 function parseHash() {
   const hash = window.location.hash
@@ -505,7 +511,7 @@ async function navigate(view, event = null) {
     console.log('[Router] Setting hash to:', expectedHash)
     window.location.hash = expectedHash
   }
-  const views = { dashboard: showDashboard, users: showUsers, buckets: showBuckets, 'content-filters': showContentFilters, multicluster: showMulticluster }
+  const views = { dashboard: showDashboard, users: showUsers, buckets: showBuckets, 'content-filters': showContentFilters, multicluster: showMulticluster, 'service-accounts': showServiceAccounts }
   await views[view]?.()
 }
 
@@ -517,7 +523,7 @@ window.addEventListener('hashchange', async () => {
   if (view && S.token) {
     setActiveNav(view)
     localStorage.setItem('llm_current_view', view)
-    const views = { dashboard: showDashboard, users: showUsers, buckets: showBuckets, 'content-filters': showContentFilters, multicluster: showMulticluster }
+    const views = { dashboard: showDashboard, users: showUsers, buckets: showBuckets, 'content-filters': showContentFilters, multicluster: showMulticluster, 'service-accounts': showServiceAccounts }
     await views[view]?.()
   }
 })
@@ -1148,7 +1154,7 @@ function renderBucketsTable() {
         return `<option value="${esc(m.model_id)}" ${selected}>${esc(m.model_id)}</option>`
       }).join('')
       defaultModelControls = `
-        <div style="display:flex;align-items:center;gap:6px;margin-top:4px">
+        <div style="display:flex;align-items:center;gap:6px">
           <select id="${selectId}" onchange="setDefaultModel(${b.id}, this.value)" style="width:100%;padding:4px 8px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-elevated);color:var(--text)">
             ${options}
           </select>
@@ -1171,10 +1177,14 @@ function renderBucketsTable() {
       <td class="actions">
         <button class="btn btn-sm btn-secondary"
                 onclick="openEditBucket(${b.id})">Edit</button>
+        <button class="btn btn-sm btn-secondary"
+                onclick="openAssignUsers(${b.id})">Assign Users</button>
         ${!b.is_default
       ? `<button class="btn btn-sm btn-secondary"
-                     onclick="setDefaultBucket(${b.id})">Set Default</button>`
-      : '<span class="btn-placeholder"></span>'}
+                     onclick="setDefaultBucket(${b.id})">Set Default</button>
+         <button class="btn btn-sm btn-danger"
+                     onclick="deleteBucket(${b.id})">Delete</button>`
+      : ''}
       </td>
     </tr>`
   }).join('')
@@ -1250,6 +1260,28 @@ async function setDefaultModel(bucketId, modelId) {
     })
     toast('Default model updated: ' + modelId, 'success')
   } catch (e) { toast(e.message, 'error') }
+}
+
+async function deleteBucket(bucketId) {
+  const bucket = S.buckets.find(b => b.id === bucketId)
+  if (!bucket) { toast('Bucket not found', 'error'); return }
+  if (bucket.is_default) {
+    toast('The default bucket cannot be deleted', 'error')
+    return
+  }
+  openModal(`Delete Bucket — ${esc(bucket.name)}`, `
+    <p style="margin-bottom:8px">
+      Delete the bucket <strong>${esc(bucket.name)}</strong>?
+    </p>
+    <p style="color:var(--muted);font-size:13px">
+      This removes its model assignments and revokes access for every user and
+      service account granted it. This cannot be undone.
+    </p>
+  `, async () => {
+    await api.delete(`/admin/buckets/${bucketId}`)
+    toast(`Bucket "${bucket.name}" deleted`, 'success')
+    await showBuckets()
+  }, 'Delete')
 }
 
 async function openCreateBucket() {
@@ -1339,6 +1371,123 @@ async function openEditBucket(bucketId) {
     toast(`Bucket "${name}" updated`, 'success')
     await showBuckets()
   }, 'Save')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Assign Users to Bucket
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function openAssignUsers(bucketId) {
+  const bucket = S.buckets.find(b => b.id === bucketId)
+  if (!bucket) {
+    toast('Bucket not found', 'error')
+    return
+  }
+
+  let allUsersResp, bucketUsersResp
+  try {
+    ;[allUsersResp, bucketUsersResp] = await Promise.all([
+      api.get('/admin/users/all'),
+      api.get(`/admin/buckets/${bucketId}/users`),
+    ])
+  } catch (e) {
+    toast(e.message, 'error')
+    return
+  }
+
+  const allUsers = (allUsersResp.data || []).slice().sort((a, b) =>
+    a.username.localeCompare(b.username)
+  )
+  const memberSet = new Set(bucketUsersResp.user_ids || [])
+  const isDefault = !!bucketUsersResp.is_default
+
+  const defaultNote = isDefault
+    ? `<p class="assign-users-default-note">
+        This is the default bucket — every user already has implicit access,
+        so explicit grants here are redundant.
+      </p>`
+    : ''
+
+  const initialCount = memberSet.size
+
+  const items = allUsers.map(u => {
+    const emailPart = u.email
+      ? `<span class="assign-users-email">${esc(u.email)}</span>`
+      : ''
+    const inactivePart = !u.is_active
+      ? `<span class="badge badge-red" style="font-size:10px;padding:1px 5px;margin-left:4px">inactive</span>`
+      : ''
+    const searchVal = (u.username + ' ' + (u.email || '')).toLowerCase()
+    return `<label class="checkbox-item" data-search="${esc(searchVal)}">
+      <input type="checkbox" value="${u.id}"
+             ${memberSet.has(u.id) ? 'checked' : ''}
+             onchange="assignUsersUpdateCount()" />
+      <span>${esc(u.username)}${emailPart}${inactivePart}</span>
+    </label>`
+  }).join('')
+
+  const checkboxGroup = allUsers.length
+    ? `<div class="checkbox-group assign-users-list" id="assign-users-list">${items}</div>`
+    : `<p style="color:var(--muted);font-size:13px">No users found.</p>`
+
+  const body = `
+    ${defaultNote}
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+      <span style="font-size:12px;color:var(--muted)">${allUsers.length} user${allUsers.length !== 1 ? 's' : ''} total</span>
+      <span id="assign-users-count" style="font-size:12px;font-weight:600;color:var(--primary)">(${initialCount} selected)</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <div class="search-wrap" style="flex:1;max-width:none">
+        ${_searchIcon}
+        <input class="search-input" type="search" placeholder="Filter users…"
+               oninput="assignUsersFilter(this.value)" />
+      </div>
+      <button class="btn btn-sm btn-secondary" type="button"
+              onclick="assignUsersSelectVisible()">Select all</button>
+      <button class="btn btn-sm btn-secondary" type="button"
+              onclick="assignUsersClearVisible()">Clear</button>
+    </div>
+    ${checkboxGroup}
+  `
+
+  openModal(`Assign Users — ${esc(bucket.name)}`, body, async () => {
+    const checkedIds = [...document.querySelectorAll('#modal-body input[type=checkbox]:checked')]
+      .map(el => parseInt(el.value, 10))
+    const res = await api.post(`/admin/buckets/${bucketId}/users`, { user_ids: checkedIds })
+    toast(`Updated: ${res.granted} granted, ${res.revoked} revoked`, 'success')
+  }, 'Apply')
+}
+
+function assignUsersFilter(val) {
+  const q = val.toLowerCase().trim()
+  document.querySelectorAll('#assign-users-list .checkbox-item').forEach(item => {
+    const match = !q || item.dataset.search.includes(q)
+    item.style.display = match ? '' : 'none'
+  })
+}
+
+function assignUsersSelectVisible() {
+  document.querySelectorAll('#assign-users-list .checkbox-item').forEach(item => {
+    if (item.style.display !== 'none') {
+      item.querySelector('input[type=checkbox]').checked = true
+    }
+  })
+  assignUsersUpdateCount()
+}
+
+function assignUsersClearVisible() {
+  document.querySelectorAll('#assign-users-list .checkbox-item').forEach(item => {
+    if (item.style.display !== 'none') {
+      item.querySelector('input[type=checkbox]').checked = false
+    }
+  })
+  assignUsersUpdateCount()
+}
+
+function assignUsersUpdateCount() {
+  const total = document.querySelectorAll('#assign-users-list input[type=checkbox]:checked').length
+  const el = document.getElementById('assign-users-count')
+  if (el) el.textContent = `(${total} selected)`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2278,6 +2427,499 @@ async function saveClusterChanges() {
  */
 function editCluster(clusterId) {
   openEditClusterModal(clusterId)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Service Accounts
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function showServiceAccounts() {
+  S.serviceAccountQuery = ''
+  setContent('<div class="loading">Loading…</div>')
+  try {
+    const [accounts, buckets] = await Promise.all([
+      api.get('/admin/service-accounts'),
+      api.get('/admin/buckets'),
+    ])
+    S.serviceAccounts = accounts
+    S.buckets = buckets
+    renderServiceAccountsTable()
+  } catch (e) { toast(e.message, 'error') }
+}
+
+function renderServiceAccountsTable() {
+  const rows = S.serviceAccounts.map(a => `
+    <tr data-name="${esc(a.name)}" data-team="${esc(a.owner_team || '')}">
+      <td><span class="cell-text-sm">${a.id}</span></td>
+      <td><span class="cell-text" title="${esc(a.name)}">${esc(a.name)}</span></td>
+      <td><span class="cell-text" title="${esc(a.owner_team || '—')}">${esc(a.owner_team || '—')}</span></td>
+      <td>${badgeStatus(a.is_active)}</td>
+      <td style="text-align:center">${a.max_concurrent_requests}</td>
+      <td class="actions">
+        <button class="btn btn-sm btn-secondary"
+                onclick="openServiceKeys(${a.id})">Manage Keys</button>
+        <button class="btn btn-sm btn-secondary"
+                onclick="openServiceBuckets(${a.id})">Buckets</button>
+        <button class="btn btn-sm ${a.is_active ? 'btn-warning' : 'btn-success'}"
+                onclick="toggleServiceActive(${a.id}, ${a.is_active})">
+          ${a.is_active ? 'Deactivate' : 'Activate'}
+        </button>
+      </td>
+    </tr>`).join('')
+
+  setContent(`
+    <div class="page">
+      <div class="page-header">
+        <h2>Service Accounts <span class="count">${S.serviceAccounts.length}</span></h2>
+        <button class="btn btn-primary" onclick="openCreateServiceAccount()">+ Create Service Account</button>
+      </div>
+      <div class="toolbar">
+        <div class="search-wrap">
+          ${_searchIcon}
+          <input class="search-input" type="search" id="sa-search"
+                 placeholder="Search by name or team…"
+                 value="${esc(S.serviceAccountQuery)}"
+                 oninput="filterServiceAccounts(this.value)" />
+        </div>
+        <span class="search-count" id="sa-search-count"></span>
+      </div>
+      <div class="card-table table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>ID</th><th>Name</th><th>Owner Team</th>
+              <th>Status</th><th>Max Concurrent</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="sa-tbody">
+            ${rows || '<tr class="no-results"><td colspan="6">No service accounts yet.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `)
+  applyServiceAccountFilter(S.serviceAccountQuery)
+}
+
+function filterServiceAccounts(val) {
+  S.serviceAccountQuery = val
+  applyServiceAccountFilter(val)
+}
+
+function applyServiceAccountFilter(q) {
+  const query = q.toLowerCase().trim()
+  let visible = 0
+  document.querySelectorAll('#sa-tbody tr[data-name]').forEach(tr => {
+    const match = !query ||
+      tr.dataset.name.toLowerCase().includes(query) ||
+      tr.dataset.team.toLowerCase().includes(query)
+    tr.style.display = match ? '' : 'none'
+    if (match) visible++
+  })
+  const countEl = document.getElementById('sa-search-count')
+  if (countEl && query) countEl.textContent = `${visible} of ${S.serviceAccounts.length} shown`
+  else if (countEl) countEl.textContent = ''
+}
+
+async function toggleServiceActive(serviceId, currentlyActive) {
+  try {
+    await api.patch(`/admin/service-accounts/${serviceId}/active`, { is_active: !currentlyActive })
+    await showServiceAccounts()
+    toast(`Service account ${currentlyActive ? 'deactivated' : 'activated'}`, 'success')
+  } catch (e) { toast(e.message, 'error') }
+}
+
+async function openCreateServiceAccount() {
+  // Ensure buckets are loaded
+  if (!S.buckets.length) {
+    try { S.buckets = await api.get('/admin/buckets') } catch { }
+  }
+
+  const validBuckets = S.buckets.filter(b => b.models && b.models.length > 0)
+  const bucketCheckboxes = validBuckets.length
+    ? validBuckets.map(b => `
+        <label class="checkbox-item">
+          <input type="checkbox" name="sa-bucket" value="${b.id}" />
+          <span>${esc(b.name)}${b.is_default
+          ? ' <span class="badge badge-blue" style="font-size:10px;padding:1px 5px">default</span>'
+          : ''}</span>
+        </label>`).join('')
+    : '<span style="color:var(--muted);font-size:12px">No buckets available</span>'
+
+  openModal('Create Service Account', `
+    <div class="form-group">
+      <label>Name</label>
+      <input id="sa-name" type="text" required placeholder="e.g. my-service" />
+      <div class="form-hint">Letters, numbers, underscores, hyphens, dots. 3–255 chars.</div>
+    </div>
+    <div class="form-group">
+      <label>Description <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+      <input id="sa-desc" type="text" placeholder="Brief description of this service account" />
+    </div>
+    <div class="form-group">
+      <label>Owner Team <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+      <input id="sa-team" type="text" placeholder="e.g. platform-eng" />
+    </div>
+    <div class="form-group">
+      <label>Max Concurrent Requests <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+      <input id="sa-maxcon" type="number" min="1" placeholder="Leave blank for default" />
+    </div>
+    <div class="form-group">
+      <label>Buckets <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+      <div class="checkbox-group">${bucketCheckboxes}</div>
+      <div class="form-hint">Grant bucket access at creation time. You can also manage this later.</div>
+    </div>
+  `, async () => {
+    const name = document.getElementById('sa-name').value.trim()
+    const description = document.getElementById('sa-desc').value.trim() || undefined
+    const owner_team = document.getElementById('sa-team').value.trim() || undefined
+    const maxConRaw = document.getElementById('sa-maxcon').value.trim()
+    const max_concurrent_requests = maxConRaw ? parseInt(maxConRaw, 10) : undefined
+    const bucket_ids = [...document.querySelectorAll('input[name=sa-bucket]:checked')]
+      .map(el => parseInt(el.value, 10))
+
+    if (!name) throw new Error('Name is required')
+    if (max_concurrent_requests !== undefined && (isNaN(max_concurrent_requests) || max_concurrent_requests < 1)) {
+      throw new Error('Max concurrent requests must be >= 1')
+    }
+
+    const body = { name }
+    if (description !== undefined) body.description = description
+    if (owner_team !== undefined) body.owner_team = owner_team
+    if (max_concurrent_requests !== undefined) body.max_concurrent_requests = max_concurrent_requests
+    if (bucket_ids.length > 0) body.bucket_ids = bucket_ids
+
+    await api.post('/admin/service-accounts', body)
+    toast(`Service account "${name}" created`, 'success')
+    await showServiceAccounts()
+  }, 'Create')
+}
+
+async function openServiceBuckets(serviceId) {
+  const account = S.serviceAccounts.find(a => a.id === serviceId)
+  if (!account) return
+
+  let allBuckets, currentIds
+  try {
+    ;[allBuckets, currentIds] = await Promise.all([
+      S.buckets.length ? Promise.resolve(S.buckets) : api.get('/admin/buckets'),
+      api.get(`/admin/service-accounts/${serviceId}/buckets`),
+    ])
+  } catch (e) { toast(e.message, 'error'); return }
+
+  const validBuckets = allBuckets.filter(b => b.models && b.models.length > 0)
+  const currentSet = new Set(currentIds)
+
+  const checkboxes = validBuckets.length
+    ? validBuckets.map(b => `
+        <label class="checkbox-item">
+          <input type="checkbox" value="${b.id}" ${currentSet.has(b.id) ? 'checked' : ''} />
+          <span>${esc(b.name)}${b.is_default
+          ? ' <span class="badge badge-blue" style="font-size:10px;padding:1px 5px">default</span>'
+          : ''}</span>
+        </label>`).join('')
+    : '<p style="color:var(--muted);font-size:13px">No buckets with available models.</p>'
+
+  openModal(`Bucket Access — ${esc(account.name)}`, `
+    <div class="checkbox-group">${checkboxes}</div>
+  `, async () => {
+    const checkedNow = new Set(
+      [...document.querySelectorAll('#modal-body input[type=checkbox]:checked')]
+        .map(el => parseInt(el.value, 10))
+    )
+    const uncheckedNow = new Set(
+      [...document.querySelectorAll('#modal-body input[type=checkbox]:not(:checked)')]
+        .map(el => parseInt(el.value, 10))
+    )
+
+    const toGrant = [...checkedNow].filter(bid => !currentSet.has(bid))
+    const toRevoke = [...uncheckedNow].filter(bid => currentSet.has(bid))
+
+    const grants = await Promise.allSettled(
+      toGrant.map(bid => api.post(`/admin/service-accounts/${serviceId}/buckets/${bid}`))
+    )
+    const revokes = await Promise.allSettled(
+      toRevoke.map(bid => api.delete(`/admin/service-accounts/${serviceId}/buckets/${bid}`))
+    )
+
+    const grantedOk = grants.filter(r => r.status === 'fulfilled').length
+    const revokedOk = revokes.filter(r => r.status === 'fulfilled').length
+    const failedCount = (grants.length - grantedOk) + (revokes.length - revokedOk)
+
+    if (failedCount > 0) {
+      toast(`Buckets updated: ${grantedOk} granted, ${revokedOk} revoked (${failedCount} failed)`, 'error')
+      throw new Error(`${failedCount} bucket operation(s) failed`)
+    }
+
+    toast(`Buckets updated: ${grantedOk} granted, ${revokedOk} revoked`, 'success')
+    await showServiceAccounts()
+  }, 'Apply')
+}
+
+async function openServiceKeys(serviceId) {
+  const account = S.serviceAccounts.find(a => a.id === serviceId)
+  if (!account) return
+
+  let keys = []
+  try {
+    keys = await api.get(`/admin/service-accounts/${serviceId}/keys`)
+  } catch (e) { toast(e.message, 'error'); return }
+
+  _renderServiceKeysModal(serviceId, account, keys)
+}
+
+function _renderServiceKeysModal(serviceId, account, keys) {
+  const activeKeys = keys.filter(k => !k.revoked_at)
+  const revokedKeys = keys.filter(k => k.revoked_at)
+
+  function fmtDate(iso) {
+    if (!iso) return '—'
+    return new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+  }
+
+  function keyRow(k) {
+    const isRevoked = !!k.revoked_at
+    const scopeLabel = (k.scopes && k.scopes.length) ? k.scopes.join(', ') : 'all'
+    const modelLabel = (k.model_ids && k.model_ids.length) ? k.model_ids.join(', ') : 'all'
+    const concLabel = k.max_concurrent_requests != null ? String(k.max_concurrent_requests) : 'account default'
+    const expiresLabel = fmtDate(k.expires_at)
+    const lastUsedLabel = fmtDate(k.last_used_at)
+    const revokedBadge = isRevoked
+      ? '<span class="badge badge-red">revoked</span>'
+      : ''
+    const revokeBtn = !isRevoked
+      ? `<button class="btn btn-sm btn-danger"
+               onclick="revokeServiceKey(${serviceId}, ${k.id})">Revoke</button>`
+      : ''
+    return `<tr style="${isRevoked ? 'opacity:.55' : ''}">
+      <td><span class="cell-text" title="${esc(k.name)}">${esc(k.name)}</span></td>
+      <td><code style="font-size:12px">${esc(k.prefix)}…</code></td>
+      <td><span class="cell-text-sm">${esc(scopeLabel)}</span></td>
+      <td><span class="cell-text-sm">${esc(modelLabel)}</span></td>
+      <td>${esc(concLabel)}</td>
+      <td>${fmtDate(k.created_at)}</td>
+      <td>${expiresLabel}</td>
+      <td>${lastUsedLabel}</td>
+      <td class="actions">${revokedBadge}${revokeBtn}</td>
+    </tr>`
+  }
+
+  const allRows = [...activeKeys, ...revokedKeys].map(keyRow).join('')
+
+  const bodyHTML = `
+    <div style="margin-bottom:12px;display:flex;justify-content:flex-end">
+      <button class="btn btn-sm btn-primary" type="button"
+              onclick="openIssueKey(${serviceId})">+ Issue Key</button>
+    </div>
+    <div class="table-wrap" style="max-height:340px;overflow-y:auto">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Name</th><th>Prefix</th><th>Scopes</th><th>Models</th>
+            <th>Max Concurrent</th><th>Created</th><th>Expires</th>
+            <th>Last Used</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${allRows || '<tr class="no-results"><td colspan="9">No keys yet. Issue one above.</td></tr>'}
+        </tbody>
+      </table>
+    </div>
+  `
+
+  // Open modal with no submit action — actions are inline
+  document.getElementById('modal-title').textContent = `API Keys — ${esc(account.name)}`
+  document.getElementById('modal-body').innerHTML = bodyHTML
+  document.getElementById('modal-overlay').classList.remove('hidden')
+  const submitBtn = document.getElementById('modal-submit')
+  submitBtn.style.display = 'none'
+  // Unconditionally restore the Cancel button as a plain Close button,
+  // because openIssueKey hides it and _renderServiceKeysModal may be
+  // re-entered (e.g. after revoking a key) while it is still hidden.
+  const cancelBtn = submitBtn.previousElementSibling
+  cancelBtn.style.display = ''
+  cancelBtn.textContent = 'Close'
+}
+
+async function revokeServiceKey(serviceId, keyId) {
+  if (!confirm('Revoke this API key? This cannot be undone and takes effect immediately.')) return
+  try {
+    await api.delete(`/admin/service-accounts/${serviceId}/keys/${keyId}`)
+    toast('Key revoked', 'success')
+    // Refresh key list in the modal
+    const account = S.serviceAccounts.find(a => a.id === serviceId)
+    const keys = await api.get(`/admin/service-accounts/${serviceId}/keys`)
+    _renderServiceKeysModal(serviceId, account, keys)
+  } catch (e) { toast(e.message, 'error') }
+}
+
+async function openIssueKey(serviceId) {
+  const account = S.serviceAccounts.find(a => a.id === serviceId)
+  if (!account) return
+
+  // Fetch all models for the restriction multi-select
+  let allModels = []
+  try { allModels = (await api.get('/admin/models')).data || [] } catch { }
+
+  const SCOPES = ['chat', 'embeddings', 'messages', 'models']
+  const scopeCheckboxes = SCOPES.map(s => `
+    <label class="checkbox-item">
+      <input type="checkbox" name="ik-scope" value="${s}" />
+      <span>${s}</span>
+    </label>`).join('')
+
+  const modelCheckboxes = allModels.length
+    ? allModels.map(m => `
+        <label class="checkbox-item">
+          <input type="checkbox" name="ik-model" value="${esc(m.id)}" />
+          <span style="font-family:monospace;font-size:12px">${esc(m.id)}</span>
+        </label>`).join('')
+    : '<span style="color:var(--muted);font-size:12px">No models available</span>'
+
+  const formHTML = `
+    <div class="form-group">
+      <label>Key Name</label>
+      <input id="ik-name" type="text" required placeholder="e.g. prod-2024-q3" />
+    </div>
+    <div class="form-group">
+      <label>Scopes <span style="font-weight:400;color:var(--muted)">(none = all operations)</span></label>
+      <div class="checkbox-group">${scopeCheckboxes}</div>
+    </div>
+    <div class="form-group">
+      <label>Model Restriction <span style="font-weight:400;color:var(--muted)">(none = all account models)</span></label>
+      <div class="checkbox-group">${modelCheckboxes}</div>
+    </div>
+    <div class="form-group">
+      <label>Max Concurrent Requests <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+      <input id="ik-maxcon" type="number" min="1" placeholder="Leave blank for account default" />
+    </div>
+    <div class="form-group">
+      <label>Expires In Days <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+      <input id="ik-expires" type="number" min="1" placeholder="Leave blank for no expiry" />
+    </div>
+  `
+
+  // Set up modal manually so we can replace the submit handler after the key is issued
+  document.getElementById('modal-title').textContent = `Issue API Key — ${esc(account.name)}`
+  document.getElementById('modal-body').innerHTML = formHTML
+  document.getElementById('modal-overlay').classList.remove('hidden')
+
+  const submitBtn = document.getElementById('modal-submit')
+  const cancelBtn = submitBtn.previousElementSibling
+  submitBtn.textContent = 'Issue Key'
+  submitBtn.style.display = ''
+  cancelBtn.textContent = 'Cancel'
+  cancelBtn.style.display = ''
+
+  submitBtn.onclick = async () => {
+    const name = document.getElementById('ik-name').value.trim()
+    if (!name) { toast('Key name is required', 'error'); return }
+
+    const scopes = [...document.querySelectorAll('input[name=ik-scope]:checked')]
+      .map(el => el.value)
+    const model_ids = [...document.querySelectorAll('input[name=ik-model]:checked')]
+      .map(el => el.value)
+    const maxConRaw = document.getElementById('ik-maxcon').value.trim()
+    const expiresRaw = document.getElementById('ik-expires').value.trim()
+
+    const max_concurrent_requests = maxConRaw ? parseInt(maxConRaw, 10) : undefined
+    const expires_in_days = expiresRaw ? parseInt(expiresRaw, 10) : undefined
+
+    if (max_concurrent_requests !== undefined && (isNaN(max_concurrent_requests) || max_concurrent_requests < 1)) {
+      toast('Max concurrent requests must be >= 1', 'error'); return
+    }
+    if (expires_in_days !== undefined && (isNaN(expires_in_days) || expires_in_days < 1)) {
+      toast('Expires in days must be >= 1', 'error'); return
+    }
+
+    const body = { name }
+    if (scopes.length) body.scopes = scopes
+    if (model_ids.length) body.model_ids = model_ids
+    if (max_concurrent_requests !== undefined) body.max_concurrent_requests = max_concurrent_requests
+    if (expires_in_days !== undefined) body.expires_in_days = expires_in_days
+
+    submitBtn.disabled = true
+    try {
+      const result = await api.post(`/admin/service-accounts/${serviceId}/keys`, body)
+
+      // Replace modal with one-time key reveal — do NOT close
+      document.getElementById('modal-title').textContent = 'API Key Issued — Save It Now'
+      document.getElementById('modal-body').innerHTML = `
+        <div class="api-key-reveal">
+          <p class="api-key-reveal-warning">
+            Copy this key now. It will not be shown again.
+          </p>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+            <input id="ik-revealed-key" type="text" readonly
+                   class="api-key-reveal-input"
+                   value="${esc(result.api_key)}"
+                   onclick="this.select()" />
+            <button class="btn btn-sm btn-primary" type="button"
+                    id="ik-copy-btn" onclick="copyIssuedKey()">Copy</button>
+          </div>
+          <p style="font-size:12px;color:var(--muted)">
+            Key name: <strong>${esc(result.name)}</strong> &middot;
+            Prefix: <code>${esc(result.prefix)}</code>
+          </p>
+        </div>
+      `
+      submitBtn.textContent = 'Done'
+      submitBtn.disabled = false
+      cancelBtn.style.display = 'none'
+
+      submitBtn.onclick = async () => {
+        submitBtn.disabled = true
+        closeModal()
+        // Re-open key list reflecting the new key
+        const keys = await api.get(`/admin/service-accounts/${serviceId}/keys`)
+        _renderServiceKeysModal(serviceId, account, keys)
+      }
+    } catch (e) {
+      toast(e.message, 'error')
+      submitBtn.disabled = false
+    }
+  }
+}
+
+async function copyIssuedKey() {
+  const input = document.getElementById('ik-revealed-key')
+  if (!input) return
+  const keyText = input.value
+  const btn = document.getElementById('ik-copy-btn')
+
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(keyText)
+    } catch { _fallbackCopyText(keyText) }
+  } else {
+    _fallbackCopyText(keyText)
+  }
+
+  if (btn) {
+    const orig = btn.textContent
+    btn.textContent = 'Copied!'
+    btn.classList.remove('btn-primary')
+    btn.classList.add('btn-success')
+    setTimeout(() => {
+      btn.textContent = orig
+      btn.classList.remove('btn-success')
+      btn.classList.add('btn-primary')
+    }, 1500)
+  }
+  toast('API key copied to clipboard', 'success')
+}
+
+function _fallbackCopyText(text) {
+  const ta = document.createElement('textarea')
+  ta.value = text
+  ta.style.position = 'fixed'
+  ta.style.left = '-9999px'
+  ta.style.top = '0'
+  document.body.appendChild(ta)
+  ta.focus()
+  ta.select()
+  try { document.execCommand('copy') } catch { }
+  document.body.removeChild(ta)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

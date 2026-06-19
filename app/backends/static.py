@@ -9,7 +9,8 @@ pod IP dynamically; the proxy layer is unaffected.
 from __future__ import annotations
 
 import logging
-from typing import AsyncIterator
+import time
+from typing import AsyncIterator, Optional
 
 import httpx
 from fastapi import Request
@@ -35,6 +36,14 @@ class StaticBackend(Backend):
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
 
+        # Availability state, maintained per-pod by the DiscoveryService.
+        # Starts optimistically available; the initial probe pass at startup
+        # corrects it before the app serves traffic. If discovery is disabled,
+        # backends simply stay available (legacy behaviour).
+        self._available: bool = True
+        self._consecutive_failures: int = 0
+        self._last_checked: Optional[float] = None
+
     # ------------------------------------------------------------------ #
     # Backend interface
     # ------------------------------------------------------------------ #
@@ -42,6 +51,51 @@ class StaticBackend(Backend):
     @property
     def model_id(self) -> str:
         return self._model_id
+
+    # ------------------------------------------------------------------ #
+    # Availability (driven by DiscoveryService)
+    # ------------------------------------------------------------------ #
+
+    @property
+    def is_available(self) -> bool:
+        """Whether this backend's upstream is currently reachable."""
+        return self._available
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    @property
+    def api_key(self) -> str:
+        return self._api_key
+
+    def set_api_key(self, api_key: str) -> None:
+        """Update the API key (used when discovery re-resolves a working key)."""
+        self._api_key = api_key
+
+    def record_probe_result(self, success: bool, failure_threshold: int = 2) -> None:
+        """
+        Apply a health-probe outcome with hysteresis.
+
+        One success re-enables the backend immediately; `failure_threshold`
+        consecutive failures are required to disable it — so an intermittent
+        blip does not flap the backend in and out of rotation.
+        """
+        self._last_checked = time.monotonic()
+        if success:
+            self._consecutive_failures = 0
+            if not self._available:
+                logger.info("Model %s is AVAILABLE again", self._model_id)
+            self._available = True
+        else:
+            self._consecutive_failures += 1
+            if self._available and self._consecutive_failures >= failure_threshold:
+                logger.warning(
+                    "Model %s marked UNAVAILABLE after %d consecutive failed probes",
+                    self._model_id,
+                    self._consecutive_failures,
+                )
+                self._available = False
     async def forward(
         self, request: Request, body: dict, upstream_url: str = "/chat/completions"
     ) -> httpx.Response:

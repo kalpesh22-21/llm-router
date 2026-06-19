@@ -11,6 +11,66 @@ Verify edits with `python3 -m py_compile <file>` (there is no `python` on PATH).
 
 ---
 
+## ✨ Discovery service (PoC, added 2026-06)
+
+Backends are now registered for **every** model at startup (even unreachable
+ones); a background `DiscoveryService` probes each **static** backend and flips
+its availability, so a down model returns **503** (not a permanent 404) and
+**auto-recovers** without a restart. Per-pod / in-memory, polling-only.
+
+Decisions locked: per-pod in-memory state · polling-only (no reactive breaker) ·
+`/v1/models` hides down models · 503+`Retry-After` for known-but-down · register
+with default key then re-resolve via `find_working_api_key` on recovery ·
+hysteresis (down after N consecutive fails, up after 1 success).
+
+Pieces:
+- [app/backends/base.py](app/backends/base.py) — `Backend.is_available` default `True`
+- [app/backends/static.py](app/backends/static.py) — availability state + `record_probe_result()` hysteresis
+- [app/backends/__init__.py](app/backends/__init__.py) — **`build_registry_from_config()`** (was missing!) registers all models
+- [app/services/discovery_service.py](app/services/discovery_service.py) — the probe loop
+- [app/routing/router.py](app/routing/router.py) — 404 unknown / 503 down
+- [app/api/proxy.py](app/api/proxy.py) — `/v1/models` filters unavailable
+- [app/metrics/collector.py](app/metrics/collector.py) — `llm_router_model_available{model_id}` gauge
+- [app/api/admin.py](app/api/admin.py) — `GET /admin/models/status`
+- [app/core/config.py](app/core/config.py) — `DISCOVERY_ENABLED` / `DISCOVERY_PROBE_INTERVAL_SECONDS` / `DISCOVERY_FAILURE_THRESHOLD`
+- [tests/test_discovery.py](tests/test_discovery.py) — hysteresis + probe + 503/404 gate units
+- E2E harness: `docker-compose.e2e.yml`, `docker/mock_upstream.py`, `config/models.e2e.yaml`, `docker/e2e_test.sh`, `docker/stubs/` (paycompy/phoenix/openinference/opentelemetry shims — see below)
+
+**Not yet built:** reactive circuit-breaking; config hot-reload for new models;
+multi-cluster discovery (multi-cluster has its own health).
+
+> ✅ **Repo is now container-runnable.** Previously `build_registry_from_config`
+> was missing and `requirements.txt` omitted `sqlparse` + optional deps. Now:
+> `build_registry_from_config` added, `sqlparse` in requirements, and `paycompy` /
+> tracing imports are guarded so the app boots without them. No stubs needed —
+> see the FIXED bugs section below.
+
+### Real bugs surfaced while running the E2E — FIXED & re-verified in Docker
+- [x] **`StrippedString` corrupted config values** — [config.py](app/core/config.py): was
+  `strip("\\n")` (strips the chars `\`/`n` → `"admin"` became `"admi"`, superuser created as
+  `admi`, `admin` login 401'd). Replaced with `_strip_config_value` =
+  `value.replace("\\n", "").strip()`. Verified: `SUPERUSER_USERNAME="admin"` now stays
+  `"admin"` and admin login works.
+- [x] **`requirements.txt` incomplete** — added `sqlparse` (real). The internal `paycompy`
+  and the tracing deps (`arize-phoenix`/`openinference-*`/`opentelemetry-*`) are now
+  **optional**: their imports are guarded ([config.py](app/core/config.py),
+  [ldap_auth.py](app/auth/ldap_auth.py), [pheonix.py](app/logging/pheonix.py)), so the app
+  boots without them (Vault errors clearly if enabled-without-paycompy; LDAP degrades to the
+  env-admin path; tracing disables). requirements.txt documents how to install them.
+  **Result: the app now boots in a clean container with NO stubs** — verified
+  (`paycompy/phoenix/openinference/opentelemetry importable=False`, app healthy, E2E passes).
+- [ ] **`docker-compose.yml` (root) is stale** — sets `DATABASE_URL`/`REDIS_URL`/`SECRET_KEY`,
+  but config reads `DATABASE_HOST/USER/PASSWORD/PORT/NAME` + `REDIS_HOST/PORT` +
+  `JWT_SECRET_KEY`. Those env vars are silently ignored. `docker-compose.e2e.yml` has a
+  working set; the root compose still needs fixing (left as-is for now).
+
+### E2E result (passed, 2026-06)
+`docker compose -f docker-compose.e2e.yml up -d --build` then `./docker/e2e_test.sh`:
+UP → `available:true`, gauge `1.0`, listed, chat `200` · DOWN (mock stopped) →
+`available:false`, gauge `0.0`, hidden from `/v1/models`, chat `503` · RECOVERED (mock
+restarted) → `available:true`, gauge `1.0`, chat `200`. Unit tests: `10 passed`.
+Teardown: `docker compose -f docker-compose.e2e.yml down -v`.
+
 ## ✅ Done (static / Phase-1)
 
 - [x] **JWT fail-closed** — refuse to boot if `VAULT_ENABLED` but `JWT_SECRET_KEY` is the placeholder/empty — [app/core/config.py](app/core/config.py)

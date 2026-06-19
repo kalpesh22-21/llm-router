@@ -23,8 +23,8 @@ CONCURRENT_TTL_SECONDS: int = settings.CONCURRENT_TTL_SECONDS
 _REDIS_POOL: Optional[aioredis.Redis] = None  # module-level singleton
 
 
-def _make_key(user_id: int) -> str:
-    return f"concurrent:{user_id}"
+def _make_key(principal: int | str) -> str:
+    return f"concurrent:{principal}"
 
 
 def _make_url(host: str, port: int) -> str:
@@ -68,16 +68,19 @@ async def get_redis() -> AsyncGenerator[aioredis.Redis, None]:
 # ---------------------------------------------------------------------------
 
 
-async def increment_concurrent(redis: aioredis.Redis, user_id: int) -> int:
+async def increment_concurrent(redis: aioredis.Redis, principal: int | str) -> int:
     """
-    Atomically increment the in-flight counter for *user_id*.
+    Atomically increment the in-flight counter for *principal*.
+
+    *principal* is an int user_id for human users and a string like
+    ``"svckey:{key_id}"`` for per-key service-account tracking.
 
     Refreshes the safety TTL on every call so that a crash does not
     leave a stale counter indefinitely.
 
     Returns the counter value *after* incrementing.
     """
-    key = _make_key(user_id)
+    key = _make_key(principal)
     pipe = redis.pipeline()
     pipe.incr(key)
     pipe.expire(key, CONCURRENT_TTL_SECONDS)
@@ -102,9 +105,12 @@ return v
 """
 
 
-async def decrement_concurrent(redis: aioredis.Redis, user_id: int) -> int:
+async def decrement_concurrent(redis: aioredis.Redis, principal: int | str) -> int:
     """
-    Atomically decrement the in-flight counter for *user_id*.
+    Atomically decrement the in-flight counter for *principal*.
+
+    *principal* is an int user_id for human users and a string like
+    ``"svckey:{key_id}"`` for per-key service-account tracking.
 
     The counter will not drop below 0 — if DECR would produce a negative
     value the key is deleted instead. The whole decrement / floor / TTL-refresh
@@ -112,7 +118,7 @@ async def decrement_concurrent(redis: aioredis.Redis, user_id: int) -> int:
 
     Returns the counter value *after* decrementing (minimum 0).
     """
-    key = _make_key(user_id)
+    key = _make_key(principal)
     result = await redis.eval(  # type: ignore[misc]
         _DECREMENT_LUA,
         1,  # number of keys
@@ -122,9 +128,9 @@ async def decrement_concurrent(redis: aioredis.Redis, user_id: int) -> int:
     return int(result)
 
 
-async def get_concurrent(redis: aioredis.Redis, user_id: int) -> int:
-    """Return the current in-flight request count for *user_id* (0 if absent)."""
-    key = _make_key(user_id)
+async def get_concurrent(redis: aioredis.Redis, principal: int | str) -> int:
+    """Return the current in-flight request count for *principal* (0 if absent)."""
+    key = _make_key(principal)
     val = await redis.get(key)
     return int(val) if val is not None else 0
 
