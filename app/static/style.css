@@ -397,6 +397,11 @@ body {
   color: #475569;
 }
 
+.badge-orange {
+  background: #fff7ed;
+  color: #c2410c;
+}
+
 /* ─── Buttons ───────────────────────────────────────────────────────────────── */
 .btn {
   display: inline-flex;

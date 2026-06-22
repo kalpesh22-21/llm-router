@@ -419,6 +419,114 @@ class ApiKey(Base):
         return f"<ApiKey id={self.id} name={self.name!r} service_id={self.service_id}>"
 
 
+# ---------------------------------------------------------------------------
+# model_backends DDL — kept in sync with migrations/schema.sql (Task 1.1).
+# Used by run_migrations() to create the table on existing DBs idempotently.
+# ---------------------------------------------------------------------------
+
+_MODEL_BACKENDS_CREATE_DDL = """\
+CREATE TABLE IF NOT EXISTS model_backends (
+    id              INT           NOT NULL AUTO_INCREMENT,
+    model_id        VARCHAR(255)  NOT NULL,
+    backend_type    VARCHAR(64)   NOT NULL DEFAULT 'static',
+    base_url        VARCHAR(2048) NOT NULL,
+    api_key_enc     TEXT                   DEFAULT NULL,
+    is_enabled      TINYINT(1)    NOT NULL DEFAULT 1,
+    source          VARCHAR(64)   NOT NULL DEFAULT 'admin_ui',
+    version         INT           NOT NULL DEFAULT 1,
+    created_at      DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                  ON UPDATE CURRENT_TIMESTAMP,
+    created_by      INT                    DEFAULT NULL,
+    updated_by      INT                    DEFAULT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_model_backends_model_id (model_id),
+    INDEX ix_model_backends_is_enabled (is_enabled),
+    CONSTRAINT fk_model_backends_created_by
+        FOREIGN KEY (created_by)
+        REFERENCES users (id)
+        ON DELETE SET NULL,
+    CONSTRAINT fk_model_backends_updated_by
+        FOREIGN KEY (updated_by)
+        REFERENCES users (id)
+        ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci\
+"""
+
+
+class ModelBackend(Base):
+    """
+    DB-driven backend registry entry (ADR-001: Dynamic Model Backend Management).
+
+    One row per logical LLM backend managed via the admin UI. Encryption and
+    decryption of api_key_enc is handled by app.services.model_backend_crypto —
+    this ORM class stores and retrieves the column as a plain string.
+
+    Ownership precedence (highest → lowest):
+      1. config/models.yaml
+      2. Kubernetes discovery
+      3. This table (DatabaseBackendSource)
+
+    If a model_id already exists in the registry from a higher-priority source,
+    DatabaseBackendSource skips it and logs a warning. To hand a model over to
+    DB management, remove it from models.yaml and insert it here via the admin UI.
+    """
+
+    __tablename__ = "model_backends"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Unique identifier for this model (e.g. "Qwen/Qwen3-8B")
+    model_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Backend implementation type; v1 only uses 'static'; reserved for 'multi_cluster' later
+    backend_type: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="static"
+    )
+    # Target inference server URL (stripped of trailing slash by the service layer)
+    base_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    # Fernet-encrypted api_key; NULL means use global API_KEY env var fallback
+    api_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Soft-disable: False causes DatabaseBackendSource to unregister this model_id
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Origin label for audit/debug ('admin_ui', 'migration', etc.)
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="admin_ui")
+    # Monotonically increasing; incremented on every UPDATE for change detection.
+    # NOTE: MySQL does NOT auto-increment this on UPDATE. Callers MUST explicitly
+    # set version = version + 1 on every write, or change detection breaks.
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    # Admin who created this entry (nullable: SET NULL on user deletion)
+    created_by: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # Admin who last updated this entry (nullable: SET NULL on user deletion)
+    updated_by: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint("model_id", name="uq_model_backends_model_id"),
+        Index("ix_model_backends_is_enabled", "is_enabled"),
+    )
+
+    # Relationships
+    creator: Mapped[User | None] = relationship("User", foreign_keys=[created_by])
+    updater: Mapped[User | None] = relationship("User", foreign_keys=[updated_by])
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"<ModelBackend id={self.id} model_id={self.model_id!r} "
+            f"backend_type={self.backend_type!r} is_enabled={self.is_enabled}>"
+        )
+
+
 class ContentFilterRule(Base):
     """
     Content filter rule for filtering user messages before they reach LLM backends.
@@ -616,7 +724,7 @@ async def create_all_tables() -> None:
 
 async def run_migrations() -> None:
     """Run any runtime migrations that cannot be handled by create_all (e.g., adding columns to existing tables)."""
-    from sqlalchemy import inspect, text
+    from sqlalchemy import inspect
 
     async with engine.begin() as conn:
 
@@ -648,3 +756,26 @@ async def run_migrations() -> None:
             logger.info("Column 'default_model' added to 'buckets' table")
         else:
             logger.info("Column 'default_model' already exists in 'buckets', skipping migration")
+
+        # --- model_backends table (ADR-001) -----------------------------------
+        def _model_backends_missing(sync_conn):
+            inspector = inspect(sync_conn)
+            return "model_backends" not in inspector.get_table_names()
+
+        needs_model_backends = await conn.run_sync(_model_backends_missing)
+        if needs_model_backends:
+            logger.info("Table 'model_backends' not found — creating it now...")
+            if dialect == "mysql":
+                # MySQL-specific DDL (TINYINT, ENGINE=InnoDB, utf8mb4, ON UPDATE)
+                await conn.execute(text(_MODEL_BACKENDS_CREATE_DDL))
+            else:
+                # Non-MySQL (e.g. SQLite test path): let SQLAlchemy create the
+                # table from the ORM metadata with dialect-appropriate types.
+                await conn.run_sync(
+                    lambda sync_conn: Base.metadata.tables["model_backends"].create(
+                        sync_conn, checkfirst=True
+                    )
+                )
+            logger.info("Table 'model_backends' created successfully")
+        else:
+            logger.info("Table 'model_backends' already exists, skipping migration")

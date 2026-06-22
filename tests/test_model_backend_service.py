@@ -74,7 +74,6 @@ def _bootstrap_stubs() -> None:
     # app.core.httpx uses X | None syntax (Python 3.10+).
     _stub_if_absent("app.core.httpx", {
         "new_http_client": lambda: None,
-        "close_http_client": _async_noop,
         "BACKEND_TIMEOUT": None,
     })
 

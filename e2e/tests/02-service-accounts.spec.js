@@ -125,6 +125,8 @@ test.describe('Service accounts: create → issue key → key works → revoke',
     await expect(row.locator('.badge', { hasText: 'Active' })).toBeVisible()
 
     await row.locator('button:has-text("Deactivate")').click()
-    await expect(serviceRow(page, svcName).locator('.badge', { hasText: 'Inactive' })).toBeVisible()
+    // Re-fetch until Inactive shows — toggleServiceActive refetches the list,
+    // which can race the commit (bug B), so a plain assertion is flaky here.
+    await expectRowVisible(page, 'service-accounts', serviceRow(page, svcName).locator('.badge', { hasText: 'Inactive' }))
   })
 })

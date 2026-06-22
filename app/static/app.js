@@ -12,6 +12,8 @@ const S = {
   contentFilters: [],
   serviceAccounts: [],
   serviceAccountQuery: '',
+  modelBackends: [],
+  modelBackendQuery: '',
   multiclusterModels: [],
   clusters: [],
   selectedClusterModel: null,
@@ -453,6 +455,10 @@ function renderShell() {
         <a class="nav-item" data-nav="service-accounts" href="#/service-accounts"
            onclick="navigate('service-accounts', event)">
           <span>🤖</span> Service Accounts
+        </a>
+        <a class="nav-item" data-nav="model-backends" href="#/model-backends"
+           onclick="navigate('model-backends', event)">
+          <span>🔌</span> Model Backends
         </a>` : ''}
       </nav>
       <div class="sidebar-footer">
@@ -479,7 +485,7 @@ function setActiveNav(id) {
 // Router
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VALID_VIEWS = ['dashboard', 'users', 'buckets', 'content-filters', 'multicluster', 'service-accounts']
+const VALID_VIEWS = ['dashboard', 'users', 'buckets', 'content-filters', 'multicluster', 'service-accounts', 'model-backends']
 
 function parseHash() {
   const hash = window.location.hash
@@ -514,7 +520,7 @@ async function navigate(view, event = null) {
     console.log('[Router] Setting hash to:', expectedHash)
     window.location.hash = expectedHash
   }
-  const views = { dashboard: showDashboard, users: showUsers, buckets: showBuckets, 'content-filters': showContentFilters, multicluster: showMulticluster, 'service-accounts': showServiceAccounts }
+  const views = { dashboard: showDashboard, users: showUsers, buckets: showBuckets, 'content-filters': showContentFilters, multicluster: showMulticluster, 'service-accounts': showServiceAccounts, 'model-backends': showModelBackends }
   await views[view]?.()
 }
 
@@ -526,7 +532,7 @@ window.addEventListener('hashchange', async () => {
   if (view && S.token) {
     setActiveNav(view)
     localStorage.setItem('llm_current_view', view)
-    const views = { dashboard: showDashboard, users: showUsers, buckets: showBuckets, 'content-filters': showContentFilters, multicluster: showMulticluster, 'service-accounts': showServiceAccounts }
+    const views = { dashboard: showDashboard, users: showUsers, buckets: showBuckets, 'content-filters': showContentFilters, multicluster: showMulticluster, 'service-accounts': showServiceAccounts, 'model-backends': showModelBackends }
     await views[view]?.()
   }
 })
@@ -2881,6 +2887,312 @@ async function openIssueKey(serviceId) {
       toast(e.message, 'error')
       submitBtn.disabled = false
     }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Model Backends
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function showModelBackends() {
+  S.modelBackendQuery = ''
+  setContent('<div class="loading">Loading…</div>')
+  try {
+    S.modelBackends = await api.get('/admin/model-backends')
+    renderModelBackendsTable()
+  } catch (e) { toast(e.message, 'error') }
+}
+
+function renderModelBackendsTable() {
+  function fmtUpdated(iso) {
+    if (!iso) return '—'
+    return esc(new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }))
+  }
+
+  function registeredCell(m) {
+    if (!m.registered) return '—'
+    if (m.available) return '<span class="badge badge-green">registered</span>'
+    return '<span class="badge badge-orange" title="Backend is registered but currently unreachable">registered, unavailable</span>'
+  }
+
+  const rows = S.modelBackends.map(m => {
+    const truncUrl = m.base_url.length > 60 ? m.base_url.slice(0, 60) + '…' : m.base_url
+    const enabledBadge = m.is_enabled
+      ? '<span class="badge badge-green">Enabled</span>'
+      : '<span class="badge badge-red">Disabled</span>'
+    const toggleLabel = m.is_enabled ? 'Disable' : 'Enable'
+    const toggleClass = m.is_enabled ? 'btn-warning' : 'btn-success'
+    return `
+    <tr data-model-id="${esc(m.model_id)}">
+      <td><span class="cell-text" style="font-family:monospace;font-size:12px" title="${esc(m.model_id)}">${esc(m.model_id)}</span></td>
+      <td><span class="cell-text" title="${esc(m.base_url)}">${esc(truncUrl)}</span></td>
+      <td>${enabledBadge}</td>
+      <td>${registeredCell(m)}</td>
+      <td><span class="cell-text-sm">${esc(m.source || '—')}</span></td>
+      <td>${fmtUpdated(m.updated_at)}</td>
+      <td class="actions">
+        <button class="btn btn-sm btn-secondary"
+                onclick='openEditModelBackend(${JSON.stringify(esc(m.model_id))})'>Edit</button>
+        <button class="btn btn-sm btn-secondary"
+                onclick='testModelBackendConnection(${JSON.stringify(esc(m.model_id))})'>Test</button>
+        <button class="btn btn-sm ${toggleClass}"
+                onclick='toggleModelBackend(${JSON.stringify(esc(m.model_id))}, ${m.is_enabled})'>
+          ${toggleLabel}
+        </button>
+        <button class="btn btn-sm btn-danger"
+                onclick='deleteModelBackend(${JSON.stringify(esc(m.model_id))})'>Delete</button>
+      </td>
+    </tr>`
+  }).join('')
+
+  setContent(`
+    <div class="page">
+      <div class="page-header">
+        <h2>Model Backends <span class="count">${S.modelBackends.length}</span></h2>
+        <button class="btn btn-primary" onclick="openCreateModelBackend()">+ Add Backend</button>
+      </div>
+      <div class="toolbar">
+        <div class="search-wrap">
+          ${_searchIcon}
+          <input class="search-input" type="search" id="mb-search"
+                 placeholder="Search by model ID…"
+                 value="${esc(S.modelBackendQuery)}"
+                 oninput="filterModelBackends(this.value)" />
+        </div>
+        <span class="search-count" id="mb-search-count"></span>
+      </div>
+      <div class="card-table table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Model ID</th><th>Base URL</th><th>Status</th>
+              <th>Registered</th><th>Source</th><th>Updated</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="mb-tbody">
+            ${rows || '<tr class="no-results"><td colspan="7">No model backends yet.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `)
+  applyModelBackendFilter(S.modelBackendQuery)
+}
+
+function filterModelBackends(val) {
+  S.modelBackendQuery = val
+  applyModelBackendFilter(val)
+}
+
+function applyModelBackendFilter(q) {
+  const query = q.toLowerCase().trim()
+  let visible = 0
+  document.querySelectorAll('#mb-tbody tr[data-model-id]').forEach(tr => {
+    const match = !query || tr.dataset.modelId.toLowerCase().includes(query)
+    tr.style.display = match ? '' : 'none'
+    if (match) visible++
+  })
+  const countEl = document.getElementById('mb-search-count')
+  if (countEl && query) countEl.textContent = `${visible} of ${S.modelBackends.length} shown`
+  else if (countEl) countEl.textContent = ''
+}
+
+// Resolve the raw (unescaped) model_id from a potentially esc()-encoded string.
+// model IDs use [a-zA-Z0-9_\-./] so esc() is a no-op for them; this decode
+// is a defensive measure in case any entity ever appears.
+function _unescModelId(escaped) {
+  return escaped
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+}
+
+async function openCreateModelBackend() {
+  openModal('Add Model Backend', `
+    <div class="form-group">
+      <label>Model ID</label>
+      <input id="mb-model-id" type="text" required
+             placeholder="e.g. Qwen/Qwen3-8B" />
+      <div class="form-hint">Allowed characters: letters, numbers, <code>_</code> <code>-</code> <code>.</code> <code>/</code></div>
+    </div>
+    <div class="form-group">
+      <label>Base URL</label>
+      <input id="mb-base-url" type="text" required
+             placeholder="http://your-model-server/v1" />
+    </div>
+    <div class="form-group">
+      <label>API Key <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+      <input id="mb-api-key" type="password"
+             placeholder="Leave blank to use global API_KEY" />
+    </div>
+    <div class="form-group">
+      <button class="btn btn-sm btn-secondary" type="button"
+              onclick="testConnectionInModal()">Test Connection</button>
+      <div id="mb-test-result" style="margin-top:8px;font-size:13px"></div>
+    </div>
+  `, async () => {
+    const model_id = document.getElementById('mb-model-id').value.trim()
+    const base_url = document.getElementById('mb-base-url').value.trim()
+    const api_key_val = document.getElementById('mb-api-key').value
+
+    if (!model_id) throw new Error('Model ID is required')
+    if (!/^[a-zA-Z0-9_\-./]+$/.test(model_id)) {
+      throw new Error('Model ID contains invalid characters. Use only letters, numbers, _ - . /')
+    }
+    if (!base_url) throw new Error('Base URL is required')
+
+    const body = { model_id, base_url }
+    if (api_key_val) body.api_key = api_key_val
+
+    await api.post('/admin/model-backends', body)
+    toast(`Backend "${model_id}" created`, 'success')
+    await showModelBackends()
+  }, 'Create')
+}
+
+async function _runConnectionTest(baseUrlElId, apiKeyElId, resultElId) {
+  const base_url = document.getElementById(baseUrlElId).value.trim()
+  const api_key_val = document.getElementById(apiKeyElId).value
+  const resultEl = document.getElementById(resultElId)
+
+  if (!base_url) {
+    if (resultEl) resultEl.innerHTML = '<span style="color:var(--danger)">Enter a Base URL first.</span>'
+    return
+  }
+
+  if (resultEl) resultEl.innerHTML = '<span style="color:var(--muted)">Testing…</span>'
+
+  try {
+    const body = { base_url }
+    if (api_key_val) body.api_key = api_key_val
+    const result = await api.post('/admin/model-backends/test-connection', body)
+
+    if (result.reachable) {
+      if (resultEl) resultEl.innerHTML = `<span style="color:var(--success)">Reachable (HTTP ${esc(String(result.status_code))})</span>`
+    } else {
+      const errMsg = result.error ? esc(result.error) : `HTTP ${esc(String(result.status_code))}`
+      if (resultEl) resultEl.innerHTML = `<span style="color:var(--danger)">Not reachable — ${errMsg}</span>`
+    }
+  } catch (e) {
+    if (resultEl) resultEl.innerHTML = `<span style="color:var(--danger)">${esc(e.message)}</span>`
+  }
+}
+
+async function testConnectionInModal() {
+  await _runConnectionTest('mb-base-url', 'mb-api-key', 'mb-test-result')
+}
+
+async function openEditModelBackend(escapedModelId) {
+  const model_id = _unescModelId(escapedModelId)
+  const m = S.modelBackends.find(b => b.model_id === model_id)
+  if (!m) { toast('Backend not found', 'error'); return }
+
+  openModal(`Edit Backend — ${esc(m.model_id)}`, `
+    <div class="form-group">
+      <label>Model ID</label>
+      <input type="text" value="${esc(m.model_id)}" readonly
+             style="background:var(--surface-2,#f5f5f5);color:var(--muted);cursor:not-allowed" />
+    </div>
+    <div class="form-group">
+      <label>Base URL</label>
+      <input id="mb-edit-base-url" type="text" required
+             value="${esc(m.base_url)}"
+             placeholder="http://your-model-server/v1" />
+    </div>
+    <div class="form-group">
+      <label>API Key <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+      <input id="mb-edit-api-key" type="password"
+             placeholder="Enter new key to rotate; leave blank to keep existing" />
+      <div class="form-hint">Leave blank to keep existing key. Enter a new value to rotate.</div>
+    </div>
+    <div class="form-group">
+      <button class="btn btn-sm btn-secondary" type="button"
+              onclick="testEditConnectionInModal()">Test Connection</button>
+      <div id="mb-edit-test-result" style="margin-top:8px;font-size:13px"></div>
+    </div>
+  `, async () => {
+    const new_base_url = document.getElementById('mb-edit-base-url').value.trim()
+    const new_api_key = document.getElementById('mb-edit-api-key').value
+
+    if (!new_base_url) throw new Error('Base URL is required')
+
+    const patch = {}
+    if (new_base_url !== m.base_url) patch.base_url = new_base_url
+    // Only include api_key if the admin typed something; blank = keep existing
+    if (new_api_key) patch.api_key = new_api_key
+
+    if (Object.keys(patch).length === 0) {
+      toast('No changes to save', 'info')
+      return
+    }
+
+    await api.patch(`/admin/model-backends/${model_id}`, patch)
+    toast(`Backend "${model_id}" updated`, 'success')
+    await showModelBackends()
+  }, 'Save')
+}
+
+async function testEditConnectionInModal() {
+  await _runConnectionTest('mb-edit-base-url', 'mb-edit-api-key', 'mb-edit-test-result')
+}
+
+async function toggleModelBackend(escapedModelId, currentlyEnabled) {
+  const model_id = _unescModelId(escapedModelId)
+  try {
+    const action = currentlyEnabled ? 'disable' : 'enable'
+    await api.post(`/admin/model-backends/${model_id}/${action}`)
+    await showModelBackends()
+    toast(`Backend "${model_id}" ${currentlyEnabled ? 'disabled' : 'enabled'}`, 'success')
+  } catch (e) { toast(e.message, 'error') }
+}
+
+async function testModelBackendConnection(escapedModelId) {
+  const model_id = _unescModelId(escapedModelId)
+  const m = S.modelBackends.find(b => b.model_id === model_id)
+  if (!m) { toast('Backend not found', 'error'); return }
+
+  // Use a simple modal to show test result inline without form submit
+  document.getElementById('modal-title').textContent = `Test Connection — ${model_id}`
+  document.getElementById('modal-body').innerHTML = `
+    <p style="color:var(--muted);font-size:13px">Testing connection to:</p>
+    <code style="font-size:12px;word-break:break-all">${esc(m.base_url)}</code>
+    <div id="mb-inline-test-result" style="margin-top:16px;font-size:13px">
+      <span style="color:var(--muted)">Testing…</span>
+    </div>
+    <p style="margin-top:12px;font-size:11px;color:var(--muted)">Note: tested without an API key (the stored key is not exposed to the browser); a key-protected server may show as unreachable.</p>
+  `
+  document.getElementById('modal-overlay').classList.remove('hidden')
+  const submitBtn = document.getElementById('modal-submit')
+  submitBtn.style.display = 'none'
+  const cancelBtn = submitBtn.previousElementSibling
+  cancelBtn.style.display = ''
+  cancelBtn.textContent = 'Close'
+
+  try {
+    const result = await api.post('/admin/model-backends/test-connection', { base_url: m.base_url })
+    const resultEl = document.getElementById('mb-inline-test-result')
+    if (!resultEl) return
+    if (result.reachable) {
+      resultEl.innerHTML = `<span style="color:var(--success)">Reachable (HTTP ${esc(String(result.status_code))})</span>`
+    } else {
+      const errMsg = result.error ? esc(result.error) : `HTTP ${esc(String(result.status_code))}`
+      resultEl.innerHTML = `<span style="color:var(--danger)">Not reachable — ${errMsg}</span>`
+    }
+  } catch (e) {
+    const resultEl = document.getElementById('mb-inline-test-result')
+    if (resultEl) resultEl.innerHTML = `<span style="color:var(--danger)">${esc(e.message)}</span>`
+  }
+}
+
+async function deleteModelBackend(escapedModelId) {
+  const model_id = _unescModelId(escapedModelId)
+  if (!confirm(`Delete backend '${model_id}'? Remove it from all buckets first.`)) return
+  try {
+    await api.delete(`/admin/model-backends/${model_id}`)
+    await showModelBackends()
+    toast(`Backend "${model_id}" deleted`, 'success')
+  } catch (e) {
+    // 409 detail lists referencing bucket names — surface it clearly
+    toast(`Cannot delete: ${e.message}`, 'error')
   }
 }
 

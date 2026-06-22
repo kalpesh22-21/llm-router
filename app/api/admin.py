@@ -61,6 +61,10 @@ from app.db.redis_client import (
 from app.services.cluster_manager import ClusterCreate, ClusterUpdate, cluster_manager
 from app.services.content_filter import content_filter_service
 from app.services.permission import permission_service
+from app.services.model_backend_service import model_backend_service
+from app.services.database_backend_source import database_backend_source, publish_models_changed
+from app.core.config import get_settings
+from app.core.httpx import new_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -1882,3 +1886,365 @@ async def revoke_key(
         db, redis, key_id=key_id, service_id=service_id
     )
     return {"detail": f"API key {key_id} revoked"}
+
+
+# ---------------------------------------------------------------------------
+# Model Backend Management (ADR-001: Dynamic Model Backend Management)
+# ---------------------------------------------------------------------------
+
+
+# -- Pydantic schemas --------------------------------------------------------
+
+
+class CreateModelBackendRequest(BaseModel):
+    """Request body for POST /admin/model-backends."""
+
+    model_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[a-zA-Z0-9_\-./]+$",
+        description="Unique model identifier (alphanumeric, underscores, hyphens, dots, slashes).",
+    )
+    base_url: str = Field(
+        ...,
+        description="Base URL of the inference server (trailing slash is stripped).",
+    )
+    api_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Plaintext API key. Stored encrypted at rest. "
+            "Omit or pass null to fall back to the global API_KEY env var."
+        ),
+    )
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, v: str) -> str:
+        """Require http:// or https:// and strip trailing slash."""
+        stripped = v.strip()
+        if not stripped.startswith(("http://", "https://")):
+            raise ValueError("base_url must start with http:// or https://")
+        return stripped.rstrip("/")
+
+
+class PatchModelBackendRequest(BaseModel):
+    """Request body for PATCH /admin/model-backends/{model_id}.
+
+    All fields are optional.  For api_key:
+      - absent from JSON body  → api_key_enc untouched (model_dump(exclude_unset=True)
+                                 omits the field, so the service layer never touches it)
+      - null or ""             → clear api_key_enc to NULL (falls back to global API_KEY env var)
+      - non-empty string       → re-encrypt and store as new ciphertext
+    Note: because the model uses Optional[str] = None, passing null and omitting the field
+    are distinguishable ONLY via exclude_unset=True in the patch handler.
+    """
+
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    is_enabled: Optional[bool] = None
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        stripped = v.strip()
+        if not stripped.startswith(("http://", "https://")):
+            raise ValueError("base_url must start with http:// or https://")
+        return stripped.rstrip("/")
+
+
+class ModelBackendResponse(BaseModel):
+    """Response shape for model_backend rows.
+
+    api_key is always null — the plaintext and ciphertext are never returned.
+    registered and available are derived from the in-process BackendRegistry.
+    """
+
+    model_id: str
+    backend_type: str
+    base_url: str
+    is_enabled: bool
+    source: str
+    version: int
+    created_at: Optional[datetime.datetime]
+    updated_at: Optional[datetime.datetime]
+    created_by: Optional[int]
+    updated_by: Optional[int]
+    # Hard-coded null — key material MUST NOT leak through serialization.
+    api_key: None = None
+    # Derived from the in-process BackendRegistry (this pod's view).
+    registered: bool
+    available: bool
+
+    model_config = {"from_attributes": True}
+
+
+class TestConnectionRequest(BaseModel):
+    """Request body for POST /admin/model-backends/test-connection."""
+
+    base_url: str
+    api_key: Optional[str] = None
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped.startswith(("http://", "https://")):
+            raise ValueError("base_url must start with http:// or https://")
+        return stripped.rstrip("/")
+
+
+class TestConnectionResponse(BaseModel):
+    """Response shape for POST /admin/model-backends/test-connection."""
+
+    reachable: bool
+    status_code: Optional[int] = None
+    error: Optional[str] = None
+
+
+# -- Helper ------------------------------------------------------------------
+
+
+def _model_backend_to_response(row) -> ModelBackendResponse:
+    """
+    Build a ModelBackendResponse from a ModelBackendRow.
+
+    registered = the model_id is present in the in-process BackendRegistry.
+    available  = registered AND backend.is_available is True.
+    api_key    = always None (hard-coded; key material never leaves the service layer).
+    """
+    backend = backend_registry.get(row.model_id)
+    registered = backend is not None
+    available = registered and backend.is_available
+    return ModelBackendResponse(
+        model_id=row.model_id,
+        backend_type=row.backend_type,
+        base_url=row.base_url,
+        is_enabled=row.is_enabled,
+        source=row.source,
+        version=row.version,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        created_by=row.created_by,
+        updated_by=row.updated_by,
+        api_key=None,
+        registered=registered,
+        available=available,
+    )
+
+
+# -- Route handlers ----------------------------------------------------------
+
+# IMPORTANT: /test-connection must be declared BEFORE /{model_id} routes so
+# FastAPI does not interpret "test-connection" as a model_id path parameter.
+
+
+@router.post(
+    "/model-backends/test-connection",
+    response_model=TestConnectionResponse,
+)
+async def test_model_backend_connection(
+    body: TestConnectionRequest,
+    _admin: Annotated[User, Depends(require_admin)],
+) -> TestConnectionResponse:
+    """
+    Test reachability of a model backend by hitting GET {base_url}/models.
+
+    base_url is expected to already include the API-version path segment (e.g.
+    http://host:9000/v1), consistent with how backends are configured in
+    config/models.yaml and how the health probe (validate_api_key) and proxy
+    (StaticBackend.forward) build upstream URLs.
+
+    The api_key is never logged.  Connection failures return reachable=false
+    with an error string rather than raising HTTP 500.
+
+    Security note: this endpoint lets an admin probe arbitrary URLs.  That is
+    intentional for an admin-only reachability tool; it is guarded by require_admin.
+    """
+    url = f"{body.base_url.rstrip('/')}/models"
+    headers: dict = {}
+    if body.api_key:
+        headers["Authorization"] = f"Bearer {body.api_key}"
+
+    try:
+        async with new_http_client() as client:
+            response = await client.get(url, headers=headers, timeout=5.0)
+        # Note: raise_for_status() is intentionally NOT called — a 4xx/5xx from
+        # the backend still means it is reachable; only connection-level errors
+        # (ConnectError, TimeoutException, etc.) set reachable=False.
+        return TestConnectionResponse(
+            reachable=True,
+            status_code=response.status_code,
+            error=None,
+        )
+    except Exception as exc:
+        return TestConnectionResponse(
+            reachable=False,
+            status_code=None,
+            error=str(exc),
+        )
+
+
+@router.post(
+    "/model-backends",
+    response_model=ModelBackendResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_model_backend(
+    body: CreateModelBackendRequest,
+    admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> ModelBackendResponse:
+    """Create a new DB-managed model backend."""
+    row = await model_backend_service.create_backend(
+        db,
+        model_id=body.model_id,
+        base_url=body.base_url,
+        api_key=body.api_key,
+        created_by=admin.id,
+    )
+    try:
+        await database_backend_source.reconcile()
+    except Exception as exc:
+        logger.warning(
+            "model-backends write: inline reconcile failed (%s); poll loop will converge within %ds",
+            exc,
+            get_settings().DB_BACKEND_POLL_INTERVAL_SECONDS,
+        )
+    await publish_models_changed()
+    return _model_backend_to_response(row)
+
+
+@router.get(
+    "/model-backends",
+    response_model=List[ModelBackendResponse],
+)
+async def list_model_backends(
+    _admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> List[ModelBackendResponse]:
+    """List all DB-managed model backends."""
+    rows = await model_backend_service.list_backends(db)
+    return [_model_backend_to_response(r) for r in rows]
+
+
+@router.get(
+    "/model-backends/{model_id:path}",
+    response_model=ModelBackendResponse,
+)
+async def get_model_backend(
+    model_id: str,
+    _admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> ModelBackendResponse:
+    """Get a single DB-managed model backend by model_id."""
+    row = await model_backend_service.get_backend(db, model_id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Model backend {model_id!r} not found",
+        )
+    return _model_backend_to_response(row)
+
+
+@router.patch(
+    "/model-backends/{model_id:path}",
+    response_model=ModelBackendResponse,
+)
+async def patch_model_backend(
+    model_id: str,
+    body: PatchModelBackendRequest,
+    admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> ModelBackendResponse:
+    """Partially update a DB-managed model backend."""
+    # Build patch dict from the request body.
+    # Use model_dump(exclude_unset=True) to distinguish "field absent" from
+    # "field present with value None / empty string".
+    patch = body.model_dump(exclude_unset=True)
+    row = await model_backend_service.update_backend(
+        db,
+        model_id=model_id,
+        patch=patch,
+        updated_by=admin.id,
+    )
+    try:
+        await database_backend_source.reconcile()
+    except Exception as exc:
+        logger.warning(
+            "model-backends write: inline reconcile failed (%s); poll loop will converge within %ds",
+            exc,
+            get_settings().DB_BACKEND_POLL_INTERVAL_SECONDS,
+        )
+    await publish_models_changed()
+    return _model_backend_to_response(row)
+
+
+@router.post(
+    "/model-backends/{model_id:path}/enable",
+    response_model=ModelBackendResponse,
+)
+async def enable_model_backend(
+    model_id: str,
+    admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> ModelBackendResponse:
+    """Enable a DB-managed model backend."""
+    row = await model_backend_service.enable_backend(db, model_id, updated_by=admin.id)
+    try:
+        await database_backend_source.reconcile()
+    except Exception as exc:
+        logger.warning(
+            "model-backends write: inline reconcile failed (%s); poll loop will converge within %ds",
+            exc,
+            get_settings().DB_BACKEND_POLL_INTERVAL_SECONDS,
+        )
+    await publish_models_changed()
+    return _model_backend_to_response(row)
+
+
+@router.post(
+    "/model-backends/{model_id:path}/disable",
+    response_model=ModelBackendResponse,
+)
+async def disable_model_backend(
+    model_id: str,
+    admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> ModelBackendResponse:
+    """Disable a DB-managed model backend."""
+    row = await model_backend_service.disable_backend(db, model_id, updated_by=admin.id)
+    try:
+        await database_backend_source.reconcile()
+    except Exception as exc:
+        logger.warning(
+            "model-backends write: inline reconcile failed (%s); poll loop will converge within %ds",
+            exc,
+            get_settings().DB_BACKEND_POLL_INTERVAL_SECONDS,
+        )
+    await publish_models_changed()
+    return _model_backend_to_response(row)
+
+
+@router.delete(
+    "/model-backends/{model_id:path}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_model_backend(
+    model_id: str,
+    admin: Annotated[User, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Delete a DB-managed model backend (rejected if referenced by any bucket)."""
+    await model_backend_service.delete_backend(db, model_id)
+    try:
+        await database_backend_source.reconcile()
+    except Exception as exc:
+        logger.warning(
+            "model-backends write: inline reconcile failed (%s); poll loop will converge within %ds",
+            exc,
+            get_settings().DB_BACKEND_POLL_INTERVAL_SECONDS,
+        )
+    await publish_models_changed()

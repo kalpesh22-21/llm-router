@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.mysql import AsyncSessionLocal, ContentFilterRule
 from app.core.config import settings
-from app.core.httpx import get_http_client
+from app.core.httpx import new_http_client
 from app.services.filters import (
     SupportedExternalURLType,
     LLMGuardFilter,
@@ -195,8 +195,6 @@ class ExternalUrlContentChecker(ContentChecker):
             return False, None, rule.violation_message
 
         try:
-            client = get_http_client()
-
             # Get and validate URL type
             url_type = self._get_url_type(rule.extra_params)
 
@@ -204,12 +202,13 @@ class ExternalUrlContentChecker(ContentChecker):
             filter_instance = self._get_filter(url_type)
             payload = filter_instance.form_payload(content, rule.extra_params)
 
-            response = await client.post(
-                rule.external_url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=self.timeout,
-            )
+            async with new_http_client() as client:
+                response = await client.post(
+                    rule.external_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=self.timeout,
+                )
             response.raise_for_status()
 
             result = response.json()

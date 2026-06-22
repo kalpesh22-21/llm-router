@@ -74,6 +74,19 @@ async function expectRowVisible(page, view, rowLocator) {
   }).toPass({ timeout: 15_000 })
 }
 
+/**
+ * Re-fetch a list view (re-click its nav) and run an arbitrary assertion,
+ * retrying until it passes. For post-mutation checks on inner cell text/state
+ * that race the commit (bug B) and aren't a simple row presence/absence.
+ */
+async function refetchAssert(page, view, assertFn) {
+  await expect(async () => {
+    await page.click(`.nav-item[data-nav="${view}"]`)
+    await settle(page)
+    await assertFn()
+  }).toPass({ timeout: 15_000 })
+}
+
 /** Like expectRowVisible but asserts the row/locator is ABSENT (e.g. after delete). */
 async function expectRowGone(page, view, rowLocator) {
   await expect(async () => {
@@ -108,6 +121,7 @@ module.exports = {
   submitModalAndClose,
   expectRowVisible,
   expectRowGone,
+  refetchAssert,
   bucketRow,
   serviceRow,
   getToken,

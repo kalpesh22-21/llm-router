@@ -46,7 +46,6 @@ def _bootstrap_stubs() -> None:
     if "app.core.httpx" not in sys.modules:
         stub_httpx = types.ModuleType("app.core.httpx")
         stub_httpx.new_http_client = lambda: None  # type: ignore[attr-defined]
-        stub_httpx.close_http_client = lambda: None  # type: ignore[attr-defined]
         sys.modules["app.core.httpx"] = stub_httpx
 
     # app.utils.api_key_validator imports app.core.httpx and makes HTTP calls.

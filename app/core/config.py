@@ -37,6 +37,7 @@ from pydantic import (
     AfterValidator,
     Field,
     field_validator,
+    model_validator,
 )
 from pydantic_settings import BaseSettings
 
@@ -307,6 +308,22 @@ class Settings(BaseSettings):
             return [x.strip() for x in v.split(",")]
         return v
 
+    @model_validator(mode="after")
+    def _validate_db_backends_requires_encryption_key(self) -> "Settings":
+        """Refuse to start with DB_BACKENDS_ENABLED=true and no encryption key.
+
+        This is a startup guard: without an encryption key, api_key values in
+        model_backends cannot be decrypted, so enabling the feature is a
+        misconfiguration.
+        """
+        if self.DB_BACKENDS_ENABLED and not self.MODEL_BACKEND_ENCRYPTION_KEY:
+            raise ValueError(
+                "DB_BACKENDS_ENABLED=true requires MODEL_BACKEND_ENCRYPTION_KEY "
+                "to be set. Generate a key with: "
+                "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+            )
+        return self
+
     CONCURRENT_TTL_SECONDS: int = Field(
         default=300,
         description="TTL (seconds) applied every time the counter is touched.",
@@ -474,6 +491,45 @@ class Settings(BaseSettings):
         default=60,
         description="TTL in seconds for the resolved service-account identity Redis cache",
         env="SERVICE_API_KEY_CACHE_TTL_SECONDS",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Dynamic model backends (ADR-001)
+    # ------------------------------------------------------------------ #
+
+    # Fernet key for encrypting model backend api_keys at rest in model_backends.
+    # Generate with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    MODEL_BACKEND_ENCRYPTION_KEY: StrippedString = Field(
+        default="",
+        description=(
+            "Fernet symmetric key used to encrypt api_key values stored in the "
+            "model_backends table. Generate with: "
+            "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+        ),
+        env="MODEL_BACKEND_ENCRYPTION_KEY",
+    )
+
+    # When True, DatabaseBackendSource loads and manages backends from the
+    # model_backends DB table.  Defaults to False so existing deployments that
+    # have not set MODEL_BACKEND_ENCRYPTION_KEY are unaffected.
+    DB_BACKENDS_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Load and manage model backends from the model_backends DB table. "
+            "Requires MODEL_BACKEND_ENCRYPTION_KEY to be set. "
+            "Default OFF so existing deployments are unaffected."
+        ),
+        env="DB_BACKENDS_ENABLED",
+    )
+
+    DB_BACKEND_POLL_INTERVAL_SECONDS: int = Field(
+        default=30,
+        description=(
+            "Seconds between DB poll cycles in DatabaseBackendSource. "
+            "Only used when DB_BACKENDS_ENABLED=true."
+        ),
+        env="DB_BACKEND_POLL_INTERVAL_SECONDS",
     )
 
     # ------------------------------------------------------------------ #

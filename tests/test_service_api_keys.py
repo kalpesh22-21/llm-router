@@ -88,8 +88,7 @@ def _bootstrap_stubs() -> None:
 
     # app.core.httpx uses `X | None` type-union syntax (Python 3.10+).
     stub_httpx = types.ModuleType("app.core.httpx")
-    stub_httpx.get_http_client = lambda: None  # type: ignore[attr-defined]
-    stub_httpx.close_http_client = _async_noop  # type: ignore[attr-defined]
+    stub_httpx.new_http_client = lambda: None  # type: ignore[attr-defined]
     sys.modules.setdefault("app.core.httpx", stub_httpx)
 
     # app.utils.api_key_validator makes outbound HTTP calls at import time.

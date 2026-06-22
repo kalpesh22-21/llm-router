@@ -11,7 +11,7 @@ import logging
 
 import httpx
 
-from app.core.httpx import get_http_client
+from app.core.httpx import new_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +37,8 @@ async def validate_api_key(base_url: str, api_key: str) -> bool:
         headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        client = get_http_client()
-        response = await client.get(url, headers=headers, timeout=1.0)
+        async with new_http_client() as client:
+            response = await client.get(url, headers=headers, timeout=1.0)
 
         if response.status_code == 200:
             logger.debug(f"API key validation succeeded for {base_url}")

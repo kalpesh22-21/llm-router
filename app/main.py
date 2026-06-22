@@ -53,10 +53,10 @@ from app.core.lifecycle import (
 from app.core.middleware import GracefulShutdownMiddleware
 from app.db.mysql import create_all_tables, run_migrations, engine, AsyncSessionLocal, User
 from app.db.redis_client import close_redis, init_redis
-from app.core.httpx import close_http_client
 from app.services.cross_pod_sync_service import cross_pod_sync_service
 from app.services.discovery_service import discovery_service
 from app.services.drain_monitor import drain_monitor
+from app.services.database_backend_source import database_backend_source
 from app.services.kubernetes_discovery import kubernetes_discovery
 from sqlalchemy import select
 
@@ -198,6 +198,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as exc:
             logger.error("Kubernetes service discovery failed to start: %s", exc)
 
+    # 3.1. Start DatabaseBackendSource — loads backends from the model_backends DB
+    # table and keeps them in sync via poll + Redis pub/sub.  Must start AFTER
+    # build_registry_from_config() and kubernetes_discovery.start() so that
+    # precedence is correctly enforced: YAML > k8s > DB.
+    if get_settings().DB_BACKENDS_ENABLED:
+        try:
+            await database_backend_source.start()
+            logger.info("DatabaseBackendSource started")
+        except Exception as exc:
+            logger.error(
+                "DatabaseBackendSource failed to start: %s", exc
+            )  # non-fatal; YAML backends still work
+
     # 3.5. Start the discovery service: run an initial probe of static backends
     # (so availability is correct before serving) and keep it in sync in the
     # background, so a down model returns 503 and auto-recovers without restart.
@@ -282,8 +295,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:
         logger.warning("Error stopping Kubernetes service discovery: %s", exc)
 
+    if get_settings().DB_BACKENDS_ENABLED:
+        try:
+            await database_backend_source.stop()
+            logger.info("DatabaseBackendSource stopped")
+        except Exception as exc:
+            logger.warning("Error stopping DatabaseBackendSource: %s", exc)
+
     await close_redis()
-    await close_http_client()
     await engine.dispose()
     logger.info("=== LLM Router shut down cleanly ===")
 

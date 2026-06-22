@@ -54,7 +54,6 @@ def _bootstrap() -> None:
     # app.core.httpx — uses `X | None` syntax on Python 3.9
     _stub_if_absent("app.core.httpx", {
         "new_http_client": lambda: None,
-        "close_http_client": lambda: None,
     })
 
     # app.utils.api_key_validator — makes HTTP calls at import time

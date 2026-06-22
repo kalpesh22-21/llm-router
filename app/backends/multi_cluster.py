@@ -29,7 +29,7 @@ import httpx
 from fastapi import HTTPException, Request
 
 from app.backends.base import Backend
-from app.backends.static import get_http_client
+from app.core.httpx import new_http_client
 from app.db.cluster_operational_state import (
     cluster_metrics_store,
     get_auto_adapt_capacity,
@@ -740,10 +740,9 @@ class MultiClusterBackend(Backend):
 
         t_send = time.monotonic()
         try:
-            url = url = f"{cluster.base_url}{upstream_url}"
-            response = await get_http_client().post(
-                url, json=body, headers=cluster.build_headers()
-            )
+            url = f"{cluster.base_url}{upstream_url}"
+            async with new_http_client() as client:
+                response = await client.post(url, json=body, headers=cluster.build_headers())
             ttft_ms = (time.monotonic() - t_send) * 1000
             await cluster.update_latency(ttft_ms, mean_itl_ms=None)
             await self._cache.set(self._model_id, messages, cluster.cluster_id)
@@ -776,29 +775,29 @@ class MultiClusterBackend(Backend):
 
         try:
             url = f"{cluster.base_url}{upstream_url}"
-            client = get_http_client()
-            async with client.stream(
-                "POST", url, json=body, headers=cluster.build_headers()
-            ) as response:
-                response.raise_for_status()
-                async for chunk in response.aiter_bytes():
-                    if chunk:
-                        now = time.monotonic()
-                        if first_chunk:
-                            ttft_ms = (now - t_send) * 1000
-                            first_chunk = False
-                        else:
-                            raw_interval_ms = (now - prev_chunk_t) * 1000
-                            content = _extract_delta_content(chunk)
-                            if content:
-                                itl_samples.append(
-                                    _itl_per_token(raw_interval_ms, content)
-                                )
+            async with new_http_client() as client:
+                async with client.stream(
+                    "POST", url, json=body, headers=cluster.build_headers()
+                ) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes():
+                        if chunk:
+                            now = time.monotonic()
+                            if first_chunk:
+                                ttft_ms = (now - t_send) * 1000
+                                first_chunk = False
                             else:
-                                # Non-content chunk (metadata, usage) — skip ITL sample
-                                pass
-                        prev_chunk_t = now
-                        yield chunk
+                                raw_interval_ms = (now - prev_chunk_t) * 1000
+                                content = _extract_delta_content(chunk)
+                                if content:
+                                    itl_samples.append(
+                                        _itl_per_token(raw_interval_ms, content)
+                                    )
+                                else:
+                                    # Non-content chunk (metadata, usage) — skip ITL sample
+                                    pass
+                            prev_chunk_t = now
+                            yield chunk
         finally:
             if ttft_ms:
                 mean_itl = sum(itl_samples) / len(itl_samples) if itl_samples else None
@@ -859,10 +858,9 @@ class MultiClusterBackend(Backend):
 
         try:
             url = f"{cluster.base_url}/embeddings"
-            response = await get_http_client().post(
-                url, json=body, headers=cluster.build_headers()
-            )
-            return response
+            async with new_http_client() as client:
+                response = await client.post(url, json=body, headers=cluster.build_headers())
+                return response
         finally:
             await cluster.release(reservation)
 

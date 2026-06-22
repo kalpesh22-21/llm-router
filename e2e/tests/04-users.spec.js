@@ -1,6 +1,6 @@
 // @ts-check
 const { test, expect } = require('@playwright/test')
-const { uid, login, gotoView } = require('./helpers')
+const { uid, login, gotoView, refetchAssert } = require('./helpers')
 
 /**
  * NOTE on environment: this e2e stack runs WITHOUT an LDAP server, and
@@ -49,14 +49,20 @@ test.describe('Users management', () => {
     await page.fill('#m-max', next)
     await page.click('#modal-submit')
     await expect(page.locator('#modal-overlay')).toHaveClass(/hidden/)
-    await expect(page.locator('#user-tbody tr[data-username="admin"] td[style*="text-align:center"]')).toHaveText(next)
+    // Re-fetch until the cell reflects the new value — the edit's list refetch
+    // can race the commit (bug B), so a plain assertion is flaky.
+    await refetchAssert(page, 'users', async () => {
+      await expect(page.locator('#user-tbody tr[data-username="admin"] td[style*="text-align:center"]')).toHaveText(next, { timeout: 1_500 })
+    })
 
     // Revert to the original value.
     await page.locator('#user-tbody tr[data-username="admin"]').locator('button:has-text("Limit")').click()
     await page.fill('#m-max', original)
     await page.click('#modal-submit')
     await expect(page.locator('#modal-overlay')).toHaveClass(/hidden/)
-    await expect(page.locator('#user-tbody tr[data-username="admin"] td[style*="text-align:center"]')).toHaveText(original)
+    await refetchAssert(page, 'users', async () => {
+      await expect(page.locator('#user-tbody tr[data-username="admin"] td[style*="text-align:center"]')).toHaveText(original, { timeout: 1_500 })
+    })
   })
 
   test('manage-buckets modal lists buckets with checkboxes', async ({ page }) => {

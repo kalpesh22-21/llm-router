@@ -16,7 +16,7 @@ import httpx
 from fastapi import Request
 
 from app.backends.base import Backend
-from app.core.httpx import get_http_client
+from app.core.httpx import new_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -108,9 +108,9 @@ class StaticBackend(Backend):
         url = f"{self._base_url}{upstream_url}"
         headers = self._build_headers()
 
-        client = get_http_client()
-        response = await client.post(url, json=body, headers=headers)
-        return response
+        async with new_http_client() as client:
+            response = await client.post(url, json=body, headers=headers)
+            return response
 
     async def forward_stream(
         self, request: Request, body: dict, upstream_url: str = "/chat/completions"
@@ -124,20 +124,20 @@ class StaticBackend(Backend):
         url = f"{self._base_url}{upstream_url}"
         headers = self._build_headers()
 
-        client = get_http_client()
-        async with client.stream("POST", url, json=body, headers=headers) as response:
-            response.raise_for_status()
-            async for chunk in response.aiter_bytes():
-                if chunk:
-                    yield chunk
+        async with new_http_client() as client:
+            async with client.stream("POST", url, json=body, headers=headers) as response:
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes():
+                    if chunk:
+                        yield chunk
 
     async def forward_embeddings(self, request: Request, body: dict) -> httpx.Response:
         """Forward an embeddings request to /embeddings on the backend."""
         url = f"{self._base_url}/embeddings"
         headers = self._build_headers()
-        client = get_http_client()
-        response = await client.post(url, json=body, headers=headers)
-        return response
+        async with new_http_client() as client:
+            response = await client.post(url, json=body, headers=headers)
+            return response
 
     # ------------------------------------------------------------------ #
     # Internal helpers

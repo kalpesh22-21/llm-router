@@ -207,3 +207,50 @@ CREATE TABLE IF NOT EXISTS api_keys (
         REFERENCES users (id)
         ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
+-- model_backends
+-- DB-driven backend registry (ADR-001: Dynamic Model Backend Management).
+-- Stores one row per logical LLM backend that is managed via the admin UI.
+--
+-- Ownership / precedence note:
+--   Backends are owned by the source that registers them first.
+--   1. config/models.yaml  — highest priority; registered at pod startup.
+--   2. Kubernetes discovery — registered before DB source starts.
+--   3. THIS TABLE (model_backends) — lowest priority; DatabaseBackendSource
+--      skips any model_id already claimed by a higher-priority source.
+--   To hand a model over to DB management, remove it from models.yaml and
+--   write it here via the admin UI.  No pod restart required.
+--
+-- api_key_enc: Fernet-encrypted (AES-128-CBC + HMAC-SHA256) api_key.
+--   NULL means "use the global API_KEY env var fallback."
+--   The plaintext key is NEVER stored or returned by any API endpoint.
+-- version: incremented on every UPDATE; used for cheap change detection
+--   by the background reconcile loop (compare DB row version vs in-memory).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS model_backends (
+    id              INT           NOT NULL AUTO_INCREMENT,
+    model_id        VARCHAR(255)  NOT NULL,
+    backend_type    VARCHAR(64)   NOT NULL DEFAULT 'static',
+    base_url        VARCHAR(2048) NOT NULL,
+    api_key_enc     TEXT                   DEFAULT NULL,
+    is_enabled      TINYINT(1)    NOT NULL DEFAULT 1,
+    source          VARCHAR(64)   NOT NULL DEFAULT 'admin_ui',
+    version         INT           NOT NULL DEFAULT 1,
+    created_at      DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                  ON UPDATE CURRENT_TIMESTAMP,
+    created_by      INT                    DEFAULT NULL,
+    updated_by      INT                    DEFAULT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_model_backends_model_id (model_id),
+    INDEX ix_model_backends_is_enabled (is_enabled),
+    CONSTRAINT fk_model_backends_created_by
+        FOREIGN KEY (created_by)
+        REFERENCES users (id)
+        ON DELETE SET NULL,
+    CONSTRAINT fk_model_backends_updated_by
+        FOREIGN KEY (updated_by)
+        REFERENCES users (id)
+        ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

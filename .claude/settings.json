@@ -163,7 +163,25 @@
       "Bash(grep -vE \"trace\\\\.zip|video\\\\.webm|test-failed|attachment|show-trace|^\\\\s*$|────\")",
       "Bash(grep -iB2 -A30 \"traceback\\\\|unhandled\\\\|service_account\\\\|service-account\")",
       "Bash(awk '/async def get_db/,/^async def [a-z]|^def [a-z]/' app/db/mysql.py)",
-      "Bash(git -C /Users/kalpeshmulye/Development/llm-router diff -- app/services/service_account.py)"
+      "Bash(git -C /Users/kalpeshmulye/Development/llm-router diff -- app/services/service_account.py)",
+      "Bash(xargs cat)",
+      "Bash(python -m pytest --version)",
+      "Bash(python -c \"import pytest_asyncio; print\\('pytest-asyncio:', pytest_asyncio.__version__\\)\")",
+      "Bash(git -C /Users/kalpeshmulye/Development/llm-router stash pop)",
+      "Bash(git -C /Users/kalpeshmulye/Development/llm-router checkout .claude/settings.json)",
+      "Bash(git -C /Users/kalpeshmulye/Development/llm-router stash -- tests/test_database_backend_source.py tests/test_model_backend_service.py tests/test_model_backend_crypto.py tests/test_service_api_keys.py app/core/httpx.py app/backends/static.py app/backends/multi_cluster.py app/utils/api_key_validator.py app/services/content_filter.py app/api/admin.py app/main.py)",
+      "Bash(python3 -m pytest tests/test_service_api_keys.py -q --no-header -k \"test_assert_scope\")",
+      "Bash(python3 -m pytest tests/ -q --no-header --ignore=tests/test_bucket_users.py --ignore=tests/test_discovery.py -k \"test_assert_scope\")",
+      "Bash(python3 -m pytest tests/ -q --no-header --ignore=tests/test_bucket_users.py --ignore=tests/test_discovery.py --ignore=tests/test_kubernetes_discovery.py)",
+      "Bash(python3 -c \"import inspect, opentelemetry.trace; print\\(inspect.getsource\\(opentelemetry.trace.use_span\\)\\)\")",
+      "Bash(python3 -m pytest tests/test_model_backend_crypto.py tests/test_model_backend_service.py tests/test_database_backend_source.py tests/test_service_api_keys.py -q --no-header)",
+      "Bash(python -m pytest tests/test_model_backend_crypto.py -q)",
+      "Bash(python -c \"import asyncio; print\\('asyncio ok'\\)\")",
+      "Bash(git --no-pager diff --stat -- app/core/httpx.py app/backends/static.py app/backends/multi_cluster.py app/utils/api_key_validator.py app/services/content_filter.py app/api/admin.py app/main.py)",
+      "Bash(python3 -c \"import pytest_asyncio; print\\('pytest-asyncio:', pytest_asyncio.__version__\\)\")",
+      "Bash(python3 -m pytest tests/test_model_backend_crypto.py -q)",
+      "Bash(python3 -c \"from opentelemetry.trace import Status, StatusCode; print\\('otel ok'\\)\")",
+      "Bash(git --no-pager diff -- app/core/httpx.py app/backends/static.py app/backends/multi_cluster.py app/utils/api_key_validator.py app/services/content_filter.py)"
     ]
   }
 }

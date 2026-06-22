@@ -101,6 +101,11 @@ services:
       DISCOVERY_K8S_RESYNC_SECONDS: "5"
       DISCOVERY_K8S_NAMESPACES: default
       DISCOVERY_K8S_CLUSTER_DOMAIN: svc.cluster.local
+      # Dynamic DB-backed model backends (UI-managed) — enabled for e2e.
+      # The encryption key is a throwaway e2e secret (like JWT_SECRET_KEY above).
+      DB_BACKENDS_ENABLED: "true"
+      MODEL_BACKEND_ENCRYPTION_KEY: wuZeemN_hCWkiILbm_ZyPNaQeEgBYT_6oj4gGUQZs48=
+      DB_BACKEND_POLL_INTERVAL_SECONDS: "5"
     volumes:
       - ./app:/app/app:ro
       - ./config:/app/config:ro
