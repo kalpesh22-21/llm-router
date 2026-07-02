@@ -62,7 +62,7 @@ class Tracing:
         )
         self.tracing_enabled = tracing_enabled
 
-    def sanitize(self, data, additional_sensitive_keys=[]):
+    def sanitize(self, data, additional_sensitive_keys=None):
         """
         Sanitizes sensitive data in input data.
 
@@ -73,6 +73,7 @@ class Tracing:
             Any: The sanitized data.
 
         """
+        additional_sensitive_keys = additional_sensitive_keys or []
 
         def sanitize_recursively(data):
             """
@@ -247,44 +248,109 @@ class Tracing:
         Async generator that wraps a StreamingResponse body iterator.
 
         Passes every chunk through to the caller unchanged while accumulating
-        the assistant text. _stream_response swallows backend/proxy exceptions
-        and surfaces them as an SSE ``error`` event, so a failed stream still
-        completes normally here — detect that and mark the span ERROR rather
-        than relying on an exception reaching this generator. The span is
-        always ended in the finally block.
+        the assistant text and any tool calls. _stream_response swallows
+        backend/proxy exceptions and surfaces them as an SSE ``error`` event,
+        so a failed stream still completes normally here — detect that and mark
+        the span ERROR rather than relying on an exception reaching this
+        generator. The span is always ended in the finally block.
         """
         parts = []
+        # Keyed by tool-call index; each value: {"id", "name", "arguments"}.
+        tool_calls_acc: Dict[int, Dict[str, Any]] = {}
         error_seen = False
         try:
             async for chunk in body_iterator:
-                text, has_error = self._parse_chunk(chunk)
+                text, tc_deltas, has_error = self._parse_chunk(chunk)
                 parts.append(text)
+                self._accumulate_tool_calls(tool_calls_acc, tc_deltas)
                 if has_error:
                     error_seen = True
                 yield chunk
             # Normal completion.
-            span.set_output("".join(parts))
+            span.set_output(self._build_stream_output(parts, tool_calls_acc))
             span.set_status(
                 Status(StatusCode.ERROR if error_seen else StatusCode.OK)
             )
         except Exception as e:
-            span.set_output("".join(parts))
+            span.set_output(self._build_stream_output(parts, tool_calls_acc))
             span.record_exception(e)
             span.set_status(Status(StatusCode.ERROR))
             raise
         finally:
             span.end()
 
+    @staticmethod
+    def _accumulate_tool_calls(
+        acc: Dict[int, Dict[str, Any]],
+        deltas: list,
+    ) -> None:
+        """
+        Merge per-chunk tool-call fragments into the running accumulator.
+
+        ``acc`` is keyed by tool-call ``index``.  Each entry holds:
+          ``id``        — call ID (set on first fragment, kept thereafter)
+          ``name``      — function name (set on first fragment, kept thereafter)
+          ``arguments`` — concatenated argument fragments streamed so far
+        """
+        for delta in deltas:
+            idx = delta.get("index", 0)
+            # bool is a subclass of int, so guard it explicitly — "index": true
+            # would otherwise collide with a legitimate index 1 entry.
+            if not isinstance(idx, int) or isinstance(idx, bool):
+                idx = 0
+            entry = acc.setdefault(idx, {"id": None, "name": None, "arguments": ""})
+            if delta.get("id") is not None:
+                entry["id"] = delta["id"]
+            if delta.get("name") is not None:
+                entry["name"] = delta["name"]
+            if delta.get("arguments"):
+                entry["arguments"] += delta["arguments"]
+
+    @staticmethod
+    def _build_stream_output(parts: list, tool_calls_acc: Dict[int, Dict[str, Any]]) -> str:
+        """
+        Build the final span output string from accumulated text and tool calls.
+
+        - Pure-text streams (no tool calls): returns ``"".join(parts)`` unchanged
+          — identical to the pre-tool-call behavior, fully backward compatible.
+        - Streams with tool calls: returns a JSON string
+          ``{"content": "<text>", "tool_calls": [...]}`` where each tool-call
+          entry is ``{"id": ..., "name": ..., "arguments": "<concatenated>"}``.
+          The ``"content"`` key is omitted when text is empty.  Tool calls are
+          ordered by their index.
+        """
+        if not tool_calls_acc:
+            return "".join(parts)
+
+        tool_calls_list = [
+            {
+                "id": entry["id"],
+                "name": entry["name"],
+                "arguments": entry["arguments"],
+            }
+            for _, entry in sorted(tool_calls_acc.items())
+        ]
+        content = "".join(parts)
+        payload: Dict[str, Any] = {"tool_calls": tool_calls_list}
+        if content:
+            payload["content"] = content
+        return json.dumps(payload, ensure_ascii=False)
+
     def _parse_chunk(self, chunk):
         """
-        Parse one SSE chunk into ``(assistant_text, has_error)``.
+        Parse one SSE chunk into ``(assistant_text, tool_call_deltas, has_error)``.
+
+        ``tool_call_deltas`` is a list of per-chunk tool-call fragments; each
+        fragment is a dict ``{"index": int, "id": str|None, "name": str|None,
+        "arguments": str}`` where ``arguments`` is the partial string in THIS
+        chunk only (empty string when absent).
 
         ``has_error`` is True when the chunk carries a top-level ``error``
         object — that is how ``_stream_response`` surfaces backend/proxy
         failures mid-stream (it swallows the exception and yields an error
         event instead of raising). Handles both the OpenAI chat.completions
         and Anthropic /v1/messages streaming formats. Never raises — returns
-        ``("", False)`` on any unexpected input.
+        ``("", [], False)`` on any unexpected input.
         """
         try:
             if isinstance(chunk, bytes):
@@ -293,6 +359,7 @@ class Tracing:
                 text = str(chunk)
 
             collected = []
+            tc_deltas = []
             has_error = False
             for raw_line in text.splitlines():
                 line = raw_line.strip()
@@ -317,22 +384,69 @@ class Tracing:
 
                 # OpenAI chat.completions streaming format.
                 for choice in payload.get("choices", []) or []:
-                    content = (choice.get("delta") or {}).get("content")
+                    delta = choice.get("delta") or {}
+
+                    # Text content.
+                    content = delta.get("content")
                     if content:
                         collected.append(content)
 
+                    # Tool calls — streamed as incremental fragments keyed by index.
+                    for tc in delta.get("tool_calls", []) or []:
+                        func = tc.get("function") or {}
+                        tc_deltas.append({
+                            "index": tc.get("index", 0),
+                            "id": tc.get("id"),
+                            "name": func.get("name"),
+                            "arguments": func.get("arguments") or "",
+                        })
+
+                    # Legacy / deprecated function_call shape (single call, index 0).
+                    # Only emit when tool_calls is absent — a delta carrying both
+                    # would otherwise overwrite the real tool name at index 0.
+                    fc = delta.get("function_call")
+                    if fc and isinstance(fc, dict) and not delta.get("tool_calls"):
+                        tc_deltas.append({
+                            "index": 0,
+                            "id": None,
+                            "name": fc.get("name"),
+                            "arguments": fc.get("arguments") or "",
+                        })
+
                 # Anthropic /v1/messages streaming format.
-                if payload.get("type") == "content_block_delta":
-                    delta = payload.get("delta") or {}
-                    if delta.get("type") == "text_delta":
-                        text_val = delta.get("text")
+                event_type = payload.get("type")
+
+                if event_type == "content_block_delta":
+                    # Use a distinct name to avoid shadowing the OpenAI choices-loop `delta`.
+                    cb_delta = payload.get("delta") or {}
+                    if cb_delta.get("type") == "text_delta":
+                        text_val = cb_delta.get("text")
                         if text_val:
                             collected.append(text_val)
+                    elif cb_delta.get("type") == "input_json_delta":
+                        # Tool-call argument fragment; index carried at payload level.
+                        tc_deltas.append({
+                            "index": payload.get("index", 0),
+                            "id": None,
+                            "name": None,
+                            "arguments": cb_delta.get("partial_json") or "",
+                        })
 
-            return "".join(collected), has_error
+                elif event_type == "content_block_start":
+                    # Carries tool-use id + name; no argument text yet.
+                    cb = payload.get("content_block") or {}
+                    if cb.get("type") == "tool_use":
+                        tc_deltas.append({
+                            "index": payload.get("index", 0),
+                            "id": cb.get("id"),
+                            "name": cb.get("name"),
+                            "arguments": "",
+                        })
+
+            return "".join(collected), tc_deltas, has_error
         except Exception:
             logger.debug("_parse_chunk: unexpected error", exc_info=True)
-            return "", False
+            return "", [], False
 
     def _extract_stream_text(self, chunk) -> str:
         """

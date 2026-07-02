@@ -15,6 +15,9 @@ from abc import ABC, abstractmethod
 import logging
 from typing import AsyncIterator, Dict, Optional
 
+# NOTE: dict is used as the type for response_headers_out to avoid an httpx
+# import at this abstraction level; callers mutate it in-place.
+
 import httpx
 from fastapi import Request
 
@@ -65,7 +68,11 @@ class Backend(ABC):
 
     @abstractmethod
     async def forward_stream(
-        self, request: Request, body: dict,upstream_url:str
+        self,
+        request: Request,
+        body: dict,
+        upstream_url: str,
+        response_headers_out: Optional[dict] = None,
     ) -> AsyncIterator[bytes]:
         """
         Forward a streaming request to the backend.
@@ -75,8 +82,16 @@ class Backend(ABC):
         inspecting them for metrics.
 
         Args:
-            request: The original FastAPI Request.
-            body:    The parsed JSON body (may be mutated before forwarding).
+            request:              The original FastAPI Request.
+            body:                 The parsed JSON body (may be mutated before
+                                  forwarding).
+            upstream_url:         Path to forward to on the backend.
+            response_headers_out: If provided, populated in-place with the
+                                  backend's response headers immediately after
+                                  the upstream connection opens (before the
+                                  first byte is yielded). Callers use this to
+                                  pass backend headers back to the client via
+                                  StreamingResponse without buffering the body.
 
         Yields:
             Raw bytes chunks from the backend's SSE stream.

@@ -17,6 +17,7 @@ from fastapi import Request
 
 from app.backends.base import Backend
 from app.core.httpx import new_http_client
+from app.core.session_headers import extract_session_headers
 
 logger = logging.getLogger(__name__)
 
@@ -103,30 +104,52 @@ class StaticBackend(Backend):
         Forward a non-streaming chat/completions request.
 
         The body is passed as-is (the proxy layer has already set stream=False).
-        Authorization is injected from the backend's api_key.
+        Authorization is injected from the backend's api_key; session/trace
+        headers from the client are merged in (router-managed headers win on
+        conflict so the client can never override Authorization).
         """
         url = f"{self._base_url}{upstream_url}"
-        headers = self._build_headers()
+        headers = self._build_headers(extra=extract_session_headers(request))
 
         async with new_http_client() as client:
             response = await client.post(url, json=body, headers=headers)
             return response
 
     async def forward_stream(
-        self, request: Request, body: dict, upstream_url: str = "/chat/completions"
+        self,
+        request: Request,
+        body: dict,
+        upstream_url: str = "/chat/completions",
+        response_headers_out: Optional[dict] = None,
     ) -> AsyncIterator[bytes]:
         """
         Forward a streaming chat/completions request.
 
         Yields raw SSE byte chunks (e.g. b"data: {...}\\n\\n") as they arrive
         from the backend. The proxy layer consumes this iterator.
+
+        Args:
+            request:              The incoming client request (used for session
+                                  header extraction).
+            body:                 The parsed JSON body.
+            upstream_url:         Path to append to ``base_url``.
+            response_headers_out: If provided, populated in-place with the
+                                  backend's response headers immediately after
+                                  the upstream connection opens (before the
+                                  first byte is yielded). Allows callers to
+                                  read backend headers for pass-through without
+                                  buffering the stream.
         """
         url = f"{self._base_url}{upstream_url}"
-        headers = self._build_headers()
+        headers = self._build_headers(extra=extract_session_headers(request))
 
         async with new_http_client() as client:
             async with client.stream("POST", url, json=body, headers=headers) as response:
                 response.raise_for_status()
+                # Populate out-param before yielding the first byte so the
+                # caller can read backend headers for StreamingResponse setup.
+                if response_headers_out is not None:
+                    response_headers_out.update(dict(response.headers))
                 async for chunk in response.aiter_bytes():
                     if chunk:
                         yield chunk
@@ -134,7 +157,7 @@ class StaticBackend(Backend):
     async def forward_embeddings(self, request: Request, body: dict) -> httpx.Response:
         """Forward an embeddings request to /embeddings on the backend."""
         url = f"{self._base_url}/embeddings"
-        headers = self._build_headers()
+        headers = self._build_headers(extra=extract_session_headers(request))
         async with new_http_client() as client:
             response = await client.post(url, json=body, headers=headers)
             return response
@@ -143,12 +166,21 @@ class StaticBackend(Backend):
     # Internal helpers
     # ------------------------------------------------------------------ #
 
-    def _build_headers(self) -> dict:
-        """Build the HTTP headers to send to the backend."""
-        headers: dict = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+    def _build_headers(self, extra: Optional[dict] = None) -> dict:
+        """
+        Build the HTTP headers to send to the backend.
+
+        Args:
+            extra: Optional additional headers (e.g. session/trace headers
+                   extracted from the client request). Router-managed headers
+                   (Content-Type, Accept, Authorization) always win over *extra*
+                   so the client can never override backend authentication.
+        """
+        # Seed with caller-supplied extras first, then overwrite with the
+        # router-managed fixed headers so they always take precedence.
+        headers: dict = dict(extra) if extra else {}
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         return headers

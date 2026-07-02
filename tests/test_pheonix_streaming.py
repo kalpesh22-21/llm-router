@@ -2,9 +2,11 @@
 Unit tests for Phoenix/OpenInference streaming tracing in app.logging.pheonix.
 
 Covers:
-  Tracing._parse_chunk          — parse one SSE chunk into (text, has_error).
-  Tracing._extract_stream_text  — pure extraction from SSE chunks (no OTel deps).
-  Tracing._trace_stream         — async generator span lifecycle using a FakeSpan.
+  Tracing._parse_chunk             — parse one SSE chunk into (text, tool_call_deltas, has_error).
+  Tracing._extract_stream_text     — pure text extraction from SSE chunks (no OTel deps).
+  Tracing._trace_stream            — async generator span lifecycle using a FakeSpan.
+  Tracing._accumulate_tool_calls   — merge per-chunk tool-call fragments into accumulator.
+  Tracing._build_stream_output     — build final span output string (plain or JSON).
 
 Bootstrap note:
   The OpenTelemetry / Phoenix libraries are optional and NOT installed in this
@@ -30,6 +32,7 @@ Known limitations (intentionally NOT fixed in pheonix.py):
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
 import sys
 import types
@@ -756,39 +759,381 @@ class TestTraceStream:
 
 
 class TestParseChunk:
-    """Direct unit tests for the _parse_chunk(chunk) -> (text, has_error) method."""
+    """Direct unit tests for the _parse_chunk(chunk) -> (text, tool_call_deltas, has_error) method."""
 
     def setup_method(self) -> None:
         self.t = _make_tracing()
 
     def test_normal_openai_chunk_returns_text_and_no_error(self):
         result = self.t._parse_chunk(_OAI_HELLO)
-        assert result == ("Hello", False)
+        assert result == ("Hello", [], False)
 
     def test_done_sentinel_returns_empty_and_no_error(self):
         result = self.t._parse_chunk(_OAI_DONE)
-        assert result == ("", False)
+        assert result == ("", [], False)
 
     def test_non_json_line_returns_empty_and_no_error(self):
         result = self.t._parse_chunk(b"data: not-json\n\n")
-        assert result == ("", False)
+        assert result == ("", [], False)
 
     def test_comment_keepalive_returns_empty_and_no_error(self):
         result = self.t._parse_chunk(b": keep-alive\n\n")
-        assert result == ("", False)
+        assert result == ("", [], False)
 
     def test_error_chunk_returns_empty_text_and_has_error_true(self):
         error_chunk = b'data: {"error": {"message": "boom", "type": "backend_error"}}\n\n'
-        text, has_error = self.t._parse_chunk(error_chunk)
+        text, tc_deltas, has_error = self.t._parse_chunk(error_chunk)
         assert text == ""
+        assert tc_deltas == []
         assert has_error is True
 
     def test_anthropic_text_delta_returns_text_and_no_error(self):
         result = self.t._parse_chunk(_ANTHROPIC_HI)
-        assert result == ("Hi", False)
+        assert result == ("Hi", [], False)
 
     def test_empty_bytes_returns_empty_and_no_error(self):
-        assert self.t._parse_chunk(b"") == ("", False)
+        assert self.t._parse_chunk(b"") == ("", [], False)
 
     def test_garbage_bytes_returns_empty_and_no_error(self):
-        assert self.t._parse_chunk(b"\xff\xfe\x00garbage") == ("", False)
+        assert self.t._parse_chunk(b"\xff\xfe\x00garbage") == ("", [], False)
+
+    # --- OpenAI tool-call fragments ---
+
+    def test_openai_tool_call_first_fragment_returns_id_and_name(self):
+        """First fragment for a tool call carries id + name; arguments is empty string."""
+        chunk = (
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc",'
+            b'"type":"function","function":{"name":"get_weather","arguments":""}}]}}]}\n\n'
+        )
+        text, tc_deltas, has_error = self.t._parse_chunk(chunk)
+        assert text == ""
+        assert has_error is False
+        assert len(tc_deltas) == 1
+        assert tc_deltas[0]["index"] == 0
+        assert tc_deltas[0]["id"] == "call_abc"
+        assert tc_deltas[0]["name"] == "get_weather"
+        assert tc_deltas[0]["arguments"] == ""
+
+    def test_openai_tool_call_argument_fragment(self):
+        """Subsequent fragments carry arguments only; id and name are absent (None)."""
+        chunk = (
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"loc"}}]}}]}\n\n'
+        )
+        text, tc_deltas, has_error = self.t._parse_chunk(chunk)
+        assert text == ""
+        assert has_error is False
+        assert len(tc_deltas) == 1
+        assert tc_deltas[0]["index"] == 0
+        assert tc_deltas[0]["id"] is None
+        assert tc_deltas[0]["name"] is None
+        assert tc_deltas[0]["arguments"] == '{"loc'
+
+    def test_openai_multiple_tool_call_indexes_in_same_chunk(self):
+        """Two tool-call entries with different indexes appear as separate deltas."""
+        chunk = (
+            b'data: {"choices":[{"delta":{"tool_calls":['
+            b'{"index":0,"id":"c1","function":{"name":"fn_a","arguments":""}},'
+            b'{"index":1,"id":"c2","function":{"name":"fn_b","arguments":""}}'
+            b']}}]}\n\n'
+        )
+        text, tc_deltas, has_error = self.t._parse_chunk(chunk)
+        assert text == ""
+        assert has_error is False
+        assert len(tc_deltas) == 2
+        indexes = {d["index"] for d in tc_deltas}
+        assert indexes == {0, 1}
+        names = {d["name"] for d in tc_deltas}
+        assert names == {"fn_a", "fn_b"}
+
+    def test_openai_legacy_function_call_shape(self):
+        """The deprecated delta.function_call shape is treated as index-0 tool call."""
+        chunk = (
+            b'data: {"choices":[{"delta":{"function_call":{"name":"legacy_fn","arguments":"{\\"x\\":1}"}}}]}\n\n'
+        )
+        text, tc_deltas, has_error = self.t._parse_chunk(chunk)
+        assert text == ""
+        assert has_error is False
+        assert len(tc_deltas) == 1
+        assert tc_deltas[0]["index"] == 0
+        assert tc_deltas[0]["id"] is None
+        assert tc_deltas[0]["name"] == "legacy_fn"
+        assert tc_deltas[0]["arguments"] == '{"x":1}'
+
+    # --- Anthropic tool-use fragments ---
+
+    def test_anthropic_content_block_start_tool_use(self):
+        """content_block_start with tool_use carries id + name; arguments is empty."""
+        chunk = (
+            b'data: {"type":"content_block_start","index":1,'
+            b'"content_block":{"type":"tool_use","id":"toolu_abc","name":"get_weather","input":{}}}\n\n'
+        )
+        text, tc_deltas, has_error = self.t._parse_chunk(chunk)
+        assert text == ""
+        assert has_error is False
+        assert len(tc_deltas) == 1
+        assert tc_deltas[0]["index"] == 1
+        assert tc_deltas[0]["id"] == "toolu_abc"
+        assert tc_deltas[0]["name"] == "get_weather"
+        assert tc_deltas[0]["arguments"] == ""
+
+    def test_anthropic_input_json_delta(self):
+        """input_json_delta carries partial_json; no id or name."""
+        chunk = (
+            b'data: {"type":"content_block_delta","index":1,'
+            b'"delta":{"type":"input_json_delta","partial_json":"{\\"loc"}}\n\n'
+        )
+        text, tc_deltas, has_error = self.t._parse_chunk(chunk)
+        assert text == ""
+        assert has_error is False
+        assert len(tc_deltas) == 1
+        assert tc_deltas[0]["index"] == 1
+        assert tc_deltas[0]["id"] is None
+        assert tc_deltas[0]["name"] is None
+        assert tc_deltas[0]["arguments"] == '{"loc'
+
+    def test_anthropic_content_block_start_text_type_yields_no_delta(self):
+        """content_block_start with type 'text' must not produce tool-call deltas."""
+        chunk = (
+            b'data: {"type":"content_block_start","index":0,'
+            b'"content_block":{"type":"text","text":""}}\n\n'
+        )
+        text, tc_deltas, has_error = self.t._parse_chunk(chunk)
+        assert text == ""
+        assert tc_deltas == []
+        assert has_error is False
+
+
+# ===========================================================================
+# Tests: _trace_stream with tool calls
+# ===========================================================================
+
+
+class TestTraceStreamToolCalls:
+    """_trace_stream integration tests covering tool-call accumulation."""
+
+    def _make_span(self) -> FakeSpan:
+        return FakeSpan()
+
+    def test_openai_tool_call_accumulates_across_chunks(self):
+        """
+        Three OpenAI chunks forming a single tool call:
+          1. First chunk: id + name, empty arguments.
+          2/3. Argument fragments concatenated in order.
+        span.set_output must receive JSON with the full concatenated arguments.
+        """
+        chunks = [
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}\n\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"loc"}}]}}]}\n\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ation\\":\\"SF\\"}"}}]}}]}\n\n',
+            _OAI_DONE,
+        ]
+
+        async def _run():
+            t = _make_tracing()
+            span = self._make_span()
+            async for _ in t._trace_stream(span, _async_iter(chunks)):
+                pass
+            return span.output
+
+        output = asyncio.run(_run())
+        parsed = json.loads(output)
+        assert parsed["tool_calls"][0]["name"] == "get_weather"
+        assert parsed["tool_calls"][0]["id"] == "call_abc"
+        assert parsed["tool_calls"][0]["arguments"] == '{"location":"SF"}'
+        assert "content" not in parsed  # no text in this stream
+
+    def test_openai_multiple_tool_calls_ordered_by_index(self):
+        """Two concurrent tool calls (index 0 and 1) appear in index order in output."""
+        chunks = [
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"fn_a","arguments":"{\\"a\\":1}"}},{"index":1,"id":"c1","function":{"name":"fn_b","arguments":"{\\"b\\":2}"}}]}}]}\n\n',
+            _OAI_DONE,
+        ]
+
+        async def _run():
+            t = _make_tracing()
+            span = self._make_span()
+            async for _ in t._trace_stream(span, _async_iter(chunks)):
+                pass
+            return span.output
+
+        output = asyncio.run(_run())
+        parsed = json.loads(output)
+        tc = parsed["tool_calls"]
+        assert len(tc) == 2
+        assert tc[0]["name"] == "fn_a"
+        assert tc[1]["name"] == "fn_b"
+
+    def test_openai_legacy_function_call_accumulates(self):
+        """Legacy delta.function_call shape is captured as index-0 tool call."""
+        chunks = [
+            b'data: {"choices":[{"delta":{"function_call":{"name":"legacy_fn","arguments":"{\\"x\\""}}}]}\n\n',
+            b'data: {"choices":[{"delta":{"function_call":{"arguments":":1}"}}}]}\n\n',
+            _OAI_DONE,
+        ]
+
+        async def _run():
+            t = _make_tracing()
+            span = self._make_span()
+            async for _ in t._trace_stream(span, _async_iter(chunks)):
+                pass
+            return span.output
+
+        output = asyncio.run(_run())
+        parsed = json.loads(output)
+        assert parsed["tool_calls"][0]["name"] == "legacy_fn"
+        assert parsed["tool_calls"][0]["arguments"] == '{"x":1}'
+
+    def test_anthropic_tool_use_accumulates_across_chunks(self):
+        """
+        Anthropic content_block_start (id+name) followed by two input_json_delta
+        fragments must produce a single tool call entry with concatenated arguments.
+        """
+        chunks = [
+            b'data: {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_abc", "name": "get_weather", "input": {}}}\n\n',
+            b'data: {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\\"loc"}}\n\n',
+            b'data: {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "ation\\":\\"SF\\"}"}}\n\n',
+            b'data: {"type":"message_stop"}\n\n',
+        ]
+
+        async def _run():
+            t = _make_tracing()
+            span = self._make_span()
+            async for _ in t._trace_stream(span, _async_iter(chunks)):
+                pass
+            return span.output
+
+        output = asyncio.run(_run())
+        parsed = json.loads(output)
+        assert parsed["tool_calls"][0]["id"] == "toolu_abc"
+        assert parsed["tool_calls"][0]["name"] == "get_weather"
+        assert parsed["tool_calls"][0]["arguments"] == '{"location":"SF"}'
+
+    def test_mixed_text_and_tool_calls_in_same_stream(self):
+        """
+        A stream that has both assistant text and a tool call must produce JSON
+        with both "content" and "tool_calls" keys.
+        """
+        chunks = [
+            _OAI_HELLO,  # text: "Hello"
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"fn","arguments":"{\\"k\\":1}"}}]}}]}\n\n',
+            _OAI_DONE,
+        ]
+
+        async def _run():
+            t = _make_tracing()
+            span = self._make_span()
+            async for _ in t._trace_stream(span, _async_iter(chunks)):
+                pass
+            return span.output
+
+        output = asyncio.run(_run())
+        parsed = json.loads(output)
+        assert parsed["content"] == "Hello"
+        assert parsed["tool_calls"][0]["name"] == "fn"
+
+    def test_pure_text_stream_output_is_plain_string_not_json(self):
+        """
+        A stream with NO tool calls must still produce a plain string (no JSON
+        wrapping) — backward compatibility guarantee.
+        """
+        chunks = [_OAI_HELLO, _OAI_WORLD, _OAI_DONE]
+
+        async def _run():
+            t = _make_tracing()
+            span = self._make_span()
+            async for _ in t._trace_stream(span, _async_iter(chunks)):
+                pass
+            return span.output
+
+        output = asyncio.run(_run())
+        assert output == "Hello world"
+
+    def test_tool_call_output_still_plain_string_on_exception_path(self):
+        """
+        When the body_iterator raises mid-stream, set_output must still receive
+        the correctly built output (plain string if no tool calls seen yet).
+        """
+
+        async def _run():
+            t = _make_tracing()
+            span = self._make_span()
+            try:
+                async for _ in t._trace_stream(
+                    span,
+                    _raising_iter([_OAI_HELLO], ValueError("oops"))
+                ):
+                    pass
+            except Exception:
+                pass
+            return span.output
+
+        output = asyncio.run(_run())
+        # Only _OAI_HELLO was processed; no tool calls — plain string expected.
+        assert output == "Hello"
+
+    def test_tool_call_json_on_exception_path_when_tool_call_seen(self):
+        """
+        When the iterator raises AFTER a tool-call chunk has been processed,
+        set_output must contain JSON with the partial tool-call data.
+        """
+        tc_chunk = (
+            b'data: {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c0",'
+            b' "function": {"name": "fn", "arguments": "{\\"x\\""}}]}}]}\n\n'
+        )
+
+        async def _run():
+            t = _make_tracing()
+            span = self._make_span()
+            try:
+                async for _ in t._trace_stream(
+                    span,
+                    _raising_iter([tc_chunk], RuntimeError("boom"))
+                ):
+                    pass
+            except Exception:
+                pass
+            return span.output
+
+        output = asyncio.run(_run())
+        parsed = json.loads(output)
+        assert parsed["tool_calls"][0]["name"] == "fn"
+        assert parsed["tool_calls"][0]["arguments"] == '{"x"'
+
+    def test_bool_index_does_not_collide_with_integer_index_1(self):
+        """
+        A malformed chunk with ``"index": true`` must NOT be merged into the
+        accumulator entry for the legitimate ``"index": 1`` tool call.
+        bool is a subclass of int so the guard must explicitly exclude it
+        (mapping it to index 0 instead).  The two entries must remain distinct.
+        """
+        # Chunk 1: legitimate index-1 tool call.
+        chunk_int = (
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c1",'
+            b'"function":{"name":"real_fn","arguments":""}}]}}]}\n\n'
+        )
+        # Chunk 2: malformed chunk where index is the JSON boolean true.
+        # Construct it via json.dumps to ensure the envelope is valid JSON.
+        import json as _json
+        chunk_bool_raw = _json.dumps({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": True, "id": "cbool", "function": {"name": "bool_fn", "arguments": ""}}
+            ]}}]
+        })
+        chunk_bool = ("data: " + chunk_bool_raw + "\n\n").encode()
+
+        async def _run():
+            t = _make_tracing()
+            span = self._make_span()
+            async for _ in t._trace_stream(span, _async_iter([chunk_int, chunk_bool, _OAI_DONE])):
+                pass
+            return span.output
+
+        output = asyncio.run(_run())
+        parsed = json.loads(output)
+        tc = parsed["tool_calls"]
+        # bool-indexed entry maps to index 0; integer-1 entry stays at index 1.
+        # Sorted by index: [0, 1] → two distinct entries.
+        assert len(tc) == 2, f"Expected 2 distinct tool-call entries, got {tc!r}"
+        names = {entry["name"] for entry in tc}
+        assert "real_fn" in names, "Legitimate index-1 entry must be present"
+        assert "bool_fn" in names, "bool-indexed entry must map to index 0, not collide"

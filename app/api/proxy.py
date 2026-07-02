@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import asyncio
 import time
 from typing import Annotated, AsyncIterator, Optional, Tuple
 
@@ -32,6 +33,11 @@ import redis.asyncio as aioredis
 
 from app.api.auth_routes import get_current_user_payload_from_request
 from app.backends.base import Backend, registry
+from app.core.session_headers import (
+    SESSION_HEADER_ALLOWLIST,
+    extract_session_headers,
+    filter_response_headers,
+)
 from app.db.mysql import get_db
 from app.db.redis_client import (
     get_redis,
@@ -175,35 +181,88 @@ def _are_all_choices_finished(payload: dict) -> bool:
     return all([choice.get("finish_reason") for choice in choices])
 
 
-def _parse_sse_data(chunk: bytes) -> Tuple[bool, Optional[dict]]:
-    """
-    Parse a single SSE chunk and return the JSON payload if present.
+def _load_chunk(data: str) -> Optional[dict]:
+    """Parse one SSE payload into a chunk dict, or None if it isn't valid JSON."""
+    try:
+        payload = json.loads(data)
+        return payload if isinstance(payload, dict) else None
+    except json.JSONDecodeError:
+        return None
 
-    SSE format: ``data: <json>\\n\\n``
+
+def _parse_sse_event(event: bytes) -> Tuple[list[dict], bool]:
     """
-    is_last = False
-    text = chunk.decode("utf-8", errors="replace").strip()
+    Parse one SSE event block into ``(chunks, saw_done)``:
+      - ``chunks``   — JSON chunk dicts to forward, in order.
+      - ``saw_done`` — True if the block carried at least one ``[DONE]`` terminal.
+
+    A well-framed event is one record. This also guards a known cache-aware
+    router corruption on tool-call responses, where several records are glued
+    into one line without the ``\\n\\n`` separators and ``[DONE]`` is duplicated
+    ahead of the real chunk, e.g.
+    ``data: [DONE]data: [DONE]data: {…tool_calls…}``. Each ``data:`` line is
+    parsed whole first and only split on the embedded ``data:`` delimiter when
+    that fails — so a payload legitimately containing "data:" is never mis-split.
+    See docs/bug-report-rust-router-sse-tool-calls.md. Never raises.
+    """
+    text = event.decode("utf-8", errors="replace") if isinstance(event, (bytes, bytearray)) else str(event)
+    chunks: list[dict] = []
+    saw_done = False
     for line in text.splitlines():
         line = line.strip()
-        if line.startswith("data:"):
-            data_str = line[len("data:") :].strip()
-            # Check for [DONE] BEFORE trying to parse as JSON
-            if data_str == "[DONE]":
-                return True, None
-            try:
-                payload = json.loads(data_str)
-                if _are_all_choices_finished(payload):
-                    is_last = True
-                return is_last, payload
-            except json.JSONDecodeError:
-                logging.warning("Failed SSE Decoding for: %s", data_str[:100])
-                continue
-    return is_last, None
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:") :].strip()
+        if not data:
+            continue
+        if data == "[DONE]":
+            saw_done = True
+        elif (chunk := _load_chunk(data)) is not None:
+            chunks.append(chunk)
+        else:
+            # Corrupted glued records: split on the `data:` delimiter and recover.
+            for seg in (s.strip() for s in data.split("data:")):
+                if seg == "[DONE]":
+                    saw_done = True
+                elif seg and (chunk := _load_chunk(seg)) is not None:
+                    chunks.append(chunk)
+                elif seg:
+                    logger.warning("Dropping unparseable SSE fragment: %s", seg[:100])
+    return chunks, saw_done
 
 
 # ---------------------------------------------------------------------------
 # Streaming proxy
 # ---------------------------------------------------------------------------
+
+
+async def _iter_sse_events(
+    byte_iter: AsyncIterator[bytes],
+) -> AsyncIterator[bytes]:
+    """
+    Re-frame an arbitrary byte stream into discrete SSE events.
+
+    ``httpx``'s ``aiter_bytes()`` yields raw socket reads with NO regard for
+    SSE event boundaries: a single read may hold several ``data: …\\n\\n``
+    events, or only part of one (a JSON payload split mid-string). This buffers
+    across reads and yields exactly one complete event block per iteration —
+    split on the ``\\n\\n`` event separator — so ``_parse_sse_records`` always
+    sees a whole event. Any trailing bytes left after the upstream closes (an
+    event without a final blank line) are flushed as a last event.
+    """
+    buffer = b""
+    async for chunk in byte_iter:
+        if not chunk:
+            continue
+        buffer += chunk
+        # Normalize CRLF so the split below catches \r\n\r\n framing too.
+        buffer = buffer.replace(b"\r\n", b"\n")
+        while b"\n\n" in buffer:
+            event, buffer = buffer.split(b"\n\n", 1)
+            if event.strip():
+                yield event
+    if buffer.strip():
+        yield buffer
 
 
 async def _stream_response(
@@ -217,6 +276,8 @@ async def _stream_response(
     start_time: float,
     redis: aioredis.Redis,
     request_landing_time: float,
+    session_headers: Optional[dict] = None,
+    response_headers_out: Optional[dict] = None,
 ) -> AsyncIterator[bytes]:
     """
     Stream SSE chunks from the backend to the client.
@@ -229,6 +290,17 @@ async def _stream_response(
 
     The concurrent-request counter is always decremented in the finally block,
     regardless of success or failure.
+
+    Args:
+        session_headers:      The subset of client request headers in the
+                              session-header allowlist that were forwarded to
+                              the backend.  Used for diagnostic comparison
+                              against the backend's response headers.
+        response_headers_out: If provided, populated in-place by the backend's
+                              ``forward_stream`` with the upstream response
+                              headers before the first byte is yielded.  The
+                              caller (streaming branch in the endpoint) reads
+                              this dict to set ``StreamingResponse`` headers.
     """
     # Ensure the backend includes usage in the last chunk
     body.setdefault("stream_options", {})["continuous_usage_stats"] = True
@@ -242,36 +314,75 @@ async def _stream_response(
         model_id=model_id,
         latency=time.monotonic() - request_landing_time,
     )
+    # GUARD: never forward an upstream [DONE] inline. The cache-aware router can
+    # duplicate it and emit it AHEAD of the final tool-call chunk (see
+    # docs/bug-report-rust-router-sse-tool-calls.md). We swallow every upstream
+    # [DONE] and emit exactly one, correctly-ordered terminal at true
+    # end-of-stream. The Anthropic /v1/messages path never sends [DONE], so
+    # saw_done stays False there and we add nothing — preserving its behavior.
+    saw_done = False
+    _backend_headers_logged = False
     try:
-        async for chunk in backend.forward_stream(
-            request, body, upstream_url=upstream_url
-        ):
-            now = time.monotonic()
-            is_last, parsed = _parse_sse_data(chunk)
-            # Track timing for actual content chunks
-            if parsed:
+        upstream = backend.forward_stream(
+            request, body, upstream_url=upstream_url,
+            response_headers_out=response_headers_out,
+        )
+        async for event in _iter_sse_events(upstream):
+            # On the first event the backend has opened the upstream connection
+            # and response_headers_out is now populated. Log a diagnostic
+            # comparison of the session headers we forwarded vs what the backend
+            # returned — non-fatal, purely informational.
+            if not _backend_headers_logged and response_headers_out is not None:
+                _backend_headers_logged = True
+                forwarded = set(session_headers or {})
+                echoed = {
+                    k.lower()
+                    for k in response_headers_out
+                    if k.lower() in SESSION_HEADER_ALLOWLIST
+                }
+                if forwarded and forwarded == echoed:
+                    logger.info(
+                        "Stream header check OK for model=%s: backend echoed all "
+                        "forwarded session headers %s",
+                        model_id,
+                        sorted(forwarded),
+                    )
+                elif forwarded:
+                    missing = sorted(forwarded - echoed)
+                    extra = sorted(echoed - forwarded)
+                    logger.warning(
+                        "Stream header mismatch for model=%s: forwarded=%s "
+                        "echoed=%s missing=%s extra=%s",
+                        model_id,
+                        sorted(forwarded),
+                        sorted(echoed),
+                        missing,
+                        extra,
+                    )
+                # If no session headers were forwarded there is nothing to compare.
+            chunks, done = _parse_sse_event(event)
+            saw_done = saw_done or done
+            for chunk in chunks:
+                now = time.monotonic()
+                # Track timing for actual content chunks
                 if first_token:
                     ttft = now - start_time
                     first_token = False
                     prev_token_time = now
                 else:
-                    itl = now - prev_token_time
-                    inter_token_latencies.append(itl)
+                    inter_token_latencies.append(now - prev_token_time)
                     prev_token_time = now
 
-                if is_last:
-                    last_usage_data = parsed.get("usage", None)
+                if _are_all_choices_finished(chunk):
+                    last_usage_data = chunk.get("usage", last_usage_data)
                 else:
-                    parsed.pop("usage", None)
+                    chunk.pop("usage", None)
                 token_counter += 1
-                yield f"data: {json.dumps(parsed)}\n\n".encode()
-            else:
-                # parsed is None: either the upstream [DONE] sentinel (is_last)
-                # or an un-parseable keepalive/comment line. Forward one
-                # well-formed [DONE] for the sentinel; skip the rest rather than
-                # emitting spurious/malformed terminators mid-stream.
-                if is_last:
-                    yield b"data: [DONE]\n\n"
+                yield f"data: {json.dumps(chunk)}\n\n".encode()
+
+        # Stream drained cleanly: emit the single terminal the client expects.
+        if saw_done:
+            yield b"data: [DONE]\n\n"
 
     except httpx.HTTPStatusError as exc:
         http_status = str(exc.response.status_code)
@@ -289,9 +400,11 @@ async def _stream_response(
         )
         yield f"data: {error_payload}\n\n".encode()
     finally:
-        # Always decrement the concurrent request counter
+        # Always decrement the concurrent request counter. Shield it so a
+        # client disconnect (which cancels this generator's task) can't abort
+        # the await mid-flight and leak an un-released increment.
         try:
-            await rate_limit_service.decrement(redis, user_id)
+            await asyncio.shield(rate_limit_service.decrement(redis, user_id))
             metrics_collector.record_concurrent_decrement(
                 model_id=model_id, username=username
             )
@@ -416,26 +529,68 @@ async def chat_completions(
     start_time = time.monotonic()
     is_streaming: bool = bool(body.get("stream", False))
 
+    session_hdrs = extract_session_headers(request)
+
     try:
         if is_streaming:
+            # Dict populated in-place by forward_stream before the first byte,
+            # then read here to attach backend headers to the StreamingResponse.
+            upstream_resp_headers: dict = {}
+            agen = _stream_response(
+                backend=backend,  # type: ignore[arg-type]
+                request=request,
+                upstream_url="/chat/completions",
+                body=body,
+                model_id=model_id,
+                user_id=principal,
+                username=username,
+                start_time=start_time,
+                redis=redis,
+                request_landing_time=request_landing_time,
+                session_headers=session_hdrs,
+                response_headers_out=upstream_resp_headers,
+            )
+
+            # Prime the generator: pulling the first item forces forward_stream
+            # to open the upstream connection, which populates upstream_resp_headers
+            # before we construct StreamingResponse (whose headers are sent
+            # before the body iterator runs). TTFT timing is unaffected because
+            # _stream_response records TTFT from start_time on its first chunk,
+            # and start_time was captured above before this call.
+            try:
+                first_chunk = await agen.__anext__()
+            except StopAsyncIteration:
+                # Empty stream (backend sent nothing). Build an empty response
+                # with whatever headers we already have.
+                first_chunk = None
+            except BaseException:
+                # Cancelled (client disconnect / timeout) before the first byte:
+                # close the generator so its finally block runs and the concurrent
+                # counter is decremented, then re-raise.
+                await agen.aclose()
+                raise
+
+            async def _with_first(
+                first: Optional[bytes], rest: AsyncIterator[bytes]
+            ) -> AsyncIterator[bytes]:
+                """Re-attach the primed first chunk in front of the remainder."""
+                if first is not None:
+                    yield first
+                async for chunk in rest:
+                    yield chunk
+
+            stream_headers: dict = {
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                # Pass through allowlisted backend response headers, then echo
+                # the session headers we forwarded so the client can correlate.
+                **filter_response_headers(upstream_resp_headers),
+                **session_hdrs,
+            }
             return StreamingResponse(
-                _stream_response(
-                    backend=backend,  # type: ignore[arg-type]
-                    request=request,
-                    upstream_url="/chat/completions",
-                    body=body,
-                    model_id=model_id,
-                    user_id=principal,
-                    username=username,
-                    start_time=start_time,
-                    redis=redis,
-                    request_landing_time=request_landing_time,
-                ),
+                _with_first(first_chunk, agen),
                 media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "X-Accel-Buffering": "no",
-                },
+                headers=stream_headers,
             )
 
         # ---- Non-streaming path ----
@@ -469,6 +624,12 @@ async def chat_completions(
         return JSONResponse(
             content=resp_body,
             status_code=response.status_code,
+            # Pass through allowlisted backend response headers; JSONResponse
+            # sets its own content-type/content-length so those are stripped.
+            headers={
+                **filter_response_headers(response.headers),
+                **session_hdrs,
+            },
         )
 
     except HTTPException:
@@ -546,6 +707,7 @@ async def embeddings(
     metrics_collector.record_concurrent_increment(model_id=model_id, username=username)
 
     start_time = time.monotonic()
+    session_hdrs = extract_session_headers(request)
 
     try:
         backend = model_router.resolve(model_id)
@@ -570,7 +732,16 @@ async def embeddings(
             output_tokens=0,
         )
 
-        return JSONResponse(content=resp_body, status_code=response.status_code)
+        return JSONResponse(
+            content=resp_body,
+            status_code=response.status_code,
+            # Pass through allowlisted backend response headers; JSONResponse
+            # sets its own content-type/content-length so those are stripped.
+            headers={
+                **filter_response_headers(response.headers),
+                **session_hdrs,
+            },
+        )
 
     except HTTPException:
         raise
@@ -714,27 +885,68 @@ async def messages(
     logger.debug(f"Took {time.monotonic() - request_landing_time} for redis")
     start_time = time.monotonic()
     is_streaming: bool = bool(body.get("stream", False))
+    session_hdrs = extract_session_headers(request)
 
     try:
         if is_streaming:
+            # Dict populated in-place by forward_stream before the first byte,
+            # then read here to attach backend headers to the StreamingResponse.
+            upstream_resp_headers: dict = {}
+            agen = _stream_response(
+                backend=backend,  # type: ignore[arg-type]
+                request=request,
+                upstream_url="/messages",
+                body=body,
+                model_id=model_id,
+                user_id=principal,
+                username=username,
+                start_time=start_time,
+                redis=redis,
+                request_landing_time=request_landing_time,
+                session_headers=session_hdrs,
+                response_headers_out=upstream_resp_headers,
+            )
+
+            # Prime the generator: pulling the first item forces forward_stream
+            # to open the upstream connection, which populates upstream_resp_headers
+            # before we construct StreamingResponse (whose headers are sent
+            # before the body iterator runs). TTFT timing is unaffected because
+            # _stream_response records TTFT from start_time on its first chunk,
+            # and start_time was captured above before this call.
+            try:
+                first_chunk = await agen.__anext__()
+            except StopAsyncIteration:
+                # Empty stream (backend sent nothing). Build an empty response
+                # with whatever headers we already have.
+                first_chunk = None
+            except BaseException:
+                # Cancelled (client disconnect / timeout) before the first byte:
+                # close the generator so its finally block runs and the concurrent
+                # counter is decremented, then re-raise.
+                await agen.aclose()
+                raise
+
+            async def _with_first_msg(
+                first: Optional[bytes], rest: AsyncIterator[bytes]
+            ) -> AsyncIterator[bytes]:
+                """Re-attach the primed first chunk in front of the remainder."""
+                if first is not None:
+                    yield first
+                async for chunk in rest:
+                    yield chunk
+
+            stream_headers: dict = {
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                # Pass through allowlisted backend response headers, then echo
+                # the session headers we forwarded so the client can correlate.
+                **filter_response_headers(upstream_resp_headers),
+                **session_hdrs,
+            }
             return StreamingResponse(
-                _stream_response(
-                    backend=backend,  # type: ignore[arg-type]
-                    request=request,
-                    upstream_url="/messages",
-                    body=body,
-                    model_id=model_id,
-                    user_id=principal,
-                    username=username,
-                    start_time=start_time,
-                    redis=redis,
-                    request_landing_time=request_landing_time,
-                ),
+                _with_first_msg(first_chunk, agen),
                 media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "X-Accel-Buffering": "no",
-                },
+                headers=stream_headers,
             )
 
         # ---- Non-streaming path ----
@@ -769,6 +981,12 @@ async def messages(
         return JSONResponse(
             content=resp_body,
             status_code=response.status_code,
+            # Pass through allowlisted backend response headers; JSONResponse
+            # sets its own content-type/content-length so those are stripped.
+            headers={
+                **filter_response_headers(response.headers),
+                **session_hdrs,
+            },
         )
 
     except HTTPException:

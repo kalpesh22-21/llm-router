@@ -11,8 +11,10 @@ This middleware ensures:
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import TYPE_CHECKING
 
+from starlette.datastructures import MutableHeaders
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware,_StreamingResponse
@@ -24,9 +26,39 @@ from app.core.lifecycle import (
 )
 
 if TYPE_CHECKING:
-    from starlette.types import ASGIApp
+    from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
+
+
+class RequestIDMiddleware:
+    """
+    Ensure every HTTP request carries an ``x-request-id`` header.
+
+    Backends such as vLLM use ``x-request-id`` to disambiguate and trace
+    individual requests in their logs. We generate a uuid4 when the client did
+    not supply one, and leave a client-provided id untouched so end-to-end
+    correlation (see app/core/session_headers.py) is preserved.
+
+    The id is injected into the ASGI ``scope`` headers, so every downstream
+    reader — the proxy endpoint echoing it back and the backend forwarders
+    sending it upstream — sees the same value via ``extract_session_headers``.
+
+    Implemented as a pure ASGI middleware (not BaseHTTPMiddleware) so it can
+    mutate request headers in place with no per-request response buffering.
+    """
+
+    def __init__(self, app: "ASGIApp") -> None:
+        self.app = app
+
+    async def __call__(self, scope: "Scope", receive: "Receive", send: "Send") -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = MutableHeaders(scope=scope)
+        if "x-request-id" not in headers:
+            headers["x-request-id"] = str(uuid.uuid4())
+        await self.app(scope, receive, send)
 
 
 class GracefulShutdownMiddleware(BaseHTTPMiddleware):

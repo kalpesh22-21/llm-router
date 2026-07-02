@@ -30,6 +30,7 @@ from fastapi import HTTPException, Request
 
 from app.backends.base import Backend
 from app.core.httpx import new_http_client
+from app.core.session_headers import extract_session_headers
 from app.db.cluster_operational_state import (
     cluster_metrics_store,
     get_auto_adapt_capacity,
@@ -388,11 +389,21 @@ class ClusterEndpoint:
         inflight = await self.get_inflight_tokens()
         return inflight / adaptive_capacity
 
-    def build_headers(self) -> dict:
-        headers: dict = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+    def build_headers(self, extra: Optional[dict] = None) -> dict:
+        """
+        Build HTTP headers for a backend request.
+
+        Args:
+            extra: Optional additional headers (e.g. session/trace headers
+                   extracted from the client request). Router-managed headers
+                   (Content-Type, Accept, Authorization) always win over *extra*
+                   so the client can never override backend authentication.
+        """
+        # Seed with caller-supplied extras, then overwrite with fixed headers
+        # so router-managed values always take precedence.
+        headers: dict = dict(extra) if extra else {}
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
@@ -729,8 +740,13 @@ class MultiClusterBackend(Backend):
     # Backend interface
     # ------------------------------------------------------------------ #
 
-    async def forward(self, request: Request, body: dict,upstream_url: str = "/chat/completions") -> httpx.Response:
-        """Non-streaming request. Uses total response time as TTFT proxy."""
+    async def forward(self, request: Request, body: dict, upstream_url: str = "/chat/completions") -> httpx.Response:
+        """
+        Non-streaming request. Uses total response time as TTFT proxy.
+
+        Session/trace headers from the client are merged into the upstream
+        request; router-managed headers (Authorization etc.) always win.
+        """
         messages = body.get("messages", [])
         cluster = await self._select_cluster(messages)
         reservation = self._compute_reservation(body)
@@ -738,20 +754,29 @@ class MultiClusterBackend(Backend):
         # Atomic check-and-reserve to prevent race conditions with cluster disable
         await self._reserve_tokens_atomic(cluster, reservation)
 
+        session_hdrs = extract_session_headers(request)
         t_send = time.monotonic()
         try:
             url = f"{cluster.base_url}{upstream_url}"
             async with new_http_client() as client:
-                response = await client.post(url, json=body, headers=cluster.build_headers())
+                response = await client.post(
+                    url, json=body, headers=cluster.build_headers(extra=session_hdrs)
+                )
             ttft_ms = (time.monotonic() - t_send) * 1000
             await cluster.update_latency(ttft_ms, mean_itl_ms=None)
             await self._cache.set(self._model_id, messages, cluster.cluster_id)
             return response
         finally:
-            await cluster.release(reservation)
+            # Shield so a client disconnect cancelling this request's task
+            # can't abort the release and leak the token reservation.
+            await asyncio.shield(cluster.release(reservation))
 
     async def forward_stream(
-        self, request: Request, body: dict, upstream_url: str = "/chat/completions"
+        self,
+        request: Request,
+        body: dict,
+        upstream_url: str = "/chat/completions",
+        response_headers_out: Optional[dict] = None,
     ) -> AsyncIterator[bytes]:
         """
         Streaming request.
@@ -759,6 +784,18 @@ class MultiClusterBackend(Backend):
         Measures TTFT and per-token ITL from the live byte stream.
         Token reservation is held for the full duration of the stream and
         released in the finally block — even on client disconnect.
+
+        Args:
+            request:              The incoming client request (used for session
+                                  header extraction).
+            body:                 The parsed JSON body.
+            upstream_url:         Path to append to the cluster's ``base_url``.
+            response_headers_out: If provided, populated in-place with the
+                                  backend's response headers immediately after
+                                  the upstream connection opens (before the
+                                  first byte is yielded). Allows callers to
+                                  read backend headers for StreamingResponse
+                                  setup without buffering the stream.
         """
         messages = body.get("messages", [])
         cluster = await self._select_cluster(messages)
@@ -767,6 +804,7 @@ class MultiClusterBackend(Backend):
         # Atomic check-and-reserve to prevent race conditions with cluster disable
         await self._reserve_tokens_atomic(cluster, reservation)
 
+        session_hdrs = extract_session_headers(request)
         t_send = time.monotonic()
         first_chunk = True
         ttft_ms: Optional[float] = None
@@ -777,9 +815,13 @@ class MultiClusterBackend(Backend):
             url = f"{cluster.base_url}{upstream_url}"
             async with new_http_client() as client:
                 async with client.stream(
-                    "POST", url, json=body, headers=cluster.build_headers()
+                    "POST", url, json=body, headers=cluster.build_headers(extra=session_hdrs)
                 ) as response:
                     response.raise_for_status()
+                    # Populate out-param before yielding the first byte so the
+                    # caller can read backend headers for StreamingResponse setup.
+                    if response_headers_out is not None:
+                        response_headers_out.update(dict(response.headers))
                     async for chunk in response.aiter_bytes():
                         if chunk:
                             now = time.monotonic()
@@ -799,12 +841,17 @@ class MultiClusterBackend(Backend):
                             prev_chunk_t = now
                             yield chunk
         finally:
+            # Shield cleanup so a client disconnect (which cancels this
+            # generator's task) can't abort these awaits mid-flight and leak
+            # the token reservation held for the request.
             if ttft_ms:
                 mean_itl = sum(itl_samples) / len(itl_samples) if itl_samples else None
-                await cluster.update_latency(ttft_ms, mean_itl_ms=mean_itl)
-            await cluster.release(reservation)
+                await asyncio.shield(cluster.update_latency(ttft_ms, mean_itl_ms=mean_itl))
+            await asyncio.shield(cluster.release(reservation))
             # Record cache even on abort — partial KV state may still exist
-            await self._cache.set(self._model_id, messages, cluster.cluster_id)
+            await asyncio.shield(
+                self._cache.set(self._model_id, messages, cluster.cluster_id)
+            )
 
     async def forward_embeddings(self, request: Request, body: dict) -> httpx.Response:
         """
@@ -856,13 +903,18 @@ class MultiClusterBackend(Backend):
         # Atomic check-and-reserve to prevent race conditions with cluster disable
         await self._reserve_tokens_atomic(cluster, reservation)
 
+        session_hdrs = extract_session_headers(request)
         try:
             url = f"{cluster.base_url}/embeddings"
             async with new_http_client() as client:
-                response = await client.post(url, json=body, headers=cluster.build_headers())
+                response = await client.post(
+                    url, json=body, headers=cluster.build_headers(extra=session_hdrs)
+                )
                 return response
         finally:
-            await cluster.release(reservation)
+            # Shield so a client disconnect cancelling this request's task
+            # can't abort the release and leak the token reservation.
+            await asyncio.shield(cluster.release(reservation))
 
     def __repr__(self) -> str:  # pragma: no cover
         return (

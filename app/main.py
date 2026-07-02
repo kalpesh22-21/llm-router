@@ -50,7 +50,7 @@ from app.core.lifecycle import (
     setup_signal_handlers,
     wait_for_active_requests,
 )
-from app.core.middleware import GracefulShutdownMiddleware
+from app.core.middleware import GracefulShutdownMiddleware, RequestIDMiddleware
 from app.db.mysql import create_all_tables, run_migrations, engine, AsyncSessionLocal, User
 from app.db.redis_client import close_redis, init_redis
 from app.services.cross_pod_sync_service import cross_pod_sync_service
@@ -332,6 +332,14 @@ def create_app() -> FastAPI:
     # Graceful shutdown middleware (must be first to catch all requests)
     # ------------------------------------------------------------------ #
     app.add_middleware(GracefulShutdownMiddleware)
+
+    # ------------------------------------------------------------------ #
+    # Request ID: stamp every request with an x-request-id (uuid4 if the
+    # client didn't supply one) so backends like vLLM can differentiate
+    # and trace individual requests. Must run before the proxy handlers
+    # and backend forwarders read the header.
+    # ------------------------------------------------------------------ #
+    app.add_middleware(RequestIDMiddleware)
 
     # ------------------------------------------------------------------ #
     # CORS
